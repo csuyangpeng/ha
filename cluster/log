@@ -1,0 +1,70 @@
+=== 开始集群测试 ===
+=== 集群初始状态检查 ===
+30. 节点网络连通性:
+✅ 10.18.30.11 可达
+✅ 10.18.30.12 可达
+✅ 10.18.30.13 可达
+
+2. Redis集群状态:
+415a5a0fb8784c3b60b6e43530e43c334381a8f1 10.18.30.12:6380@16380 slave e5b799c65571e3b3ef980e213943570a4d815dc4 0 1761555569022 1 connected
+3827aaf1294de78b4acf1b7a62645ebb104ba598 10.18.30.13:6380@16380 slave 421a265225964b9f9075b55793adc7fdf65d4e9d 0 1761555569000 3 connected
+421a265225964b9f9075b55793adc7fdf65d4e9d 10.18.30.12:6379@16379 master - 0 1761555568000 3 connected 5461-10922
+e5b799c65571e3b3ef980e213943570a4d815dc4 10.18.30.11:6379@16379 myself,master - 0 1761555567000 1 connected 0-5460
+c2ad70714ffbd78b9e47e78ffa61fc683fd31142 10.18.30.13:6379@16379 slave 5c4f08672e10d2ecc895e6d837c45deab1271892 0 1761555569022 7 connected
+5c4f08672e10d2ecc895e6d837c45deab1271892 10.18.30.11:6380@16380 master - 0 1761555569422 7 connected 10923-16383
+
+3. MySQL MGR状态:
+CHANNEL_NAME	MEMBER_ID	MEMBER_HOST	MEMBER_PORT	MEMBER_STATE	MEMBER_ROLE	MEMBER_VERSION	MEMBER_COMMUNICATION_STACK
+group_replication_applier	1998f743-9d1a-11f0-888c-908d6ec47350	10.18.30.12	3306	ONLINE	PRIMARY	8.0.40	MySQL
+group_replication_applier	1f14c9b1-9d1a-11f0-89d2-208810c2575e	10.18.30.13	3306	ONLINE	SECONDARY	8.0.40	MySQL
+group_replication_applier	e6585e35-9d19-11f0-887c-34735aa16880	10.18.30.11	3306	ONLINE	SECONDARY	8.0.40	MySQL
+
+4. etcd集群状态:
++------------------+------------------+---------+---------+-----------+-----------+------------+
+|     ENDPOINT     |        ID        | VERSION | DB SIZE | IS LEADER | RAFT TERM | RAFT INDEX |
++------------------+------------------+---------+---------+-----------+-----------+------------+
+| 10.18.30.11:2379 | 67d29146d07ef642 |  3.5.16 |  471 kB |     false |         3 |       1003 |
+| 10.18.30.12:2379 | dc7c9350c72a6df3 |  3.5.16 |  467 kB |      true |         3 |       1003 |
+| 10.18.30.13:2379 | ae44e7df0a622a3b |  3.5.16 |  471 kB |     false |         3 |       1003 |
++------------------+------------------+---------+---------+-----------+-----------+------------+
+
+5. MySQL Router连接测试:
+@@server_id
+2
+=== 开始读写测试 ===
+1. Redis写测试:
+OK
+OK
+2. Redis读测试:
+value_1761555569
+value_1761555569
+
+3. MySQL写测试:
+4. MySQL读测试:
+id	data	timestamp
+1	test_data	2025-10-27 08:59:06
+
+5. etcd写测试:
+OK
+6. etcd读测试:
+test_key
+etcd_value_1761555570
+=== 数据一致性验证 ===
+30. Redis数据一致性:
+节点 10.18.30.11: test_key = value_1761555569
+节点 10.18.30.12: test_key = value_1761555569
+节点 10.18.30.13: test_key = value_1761555569
+
+2. MySQL数据一致性:
+节点 10.18.30.11: 记录数 = 1
+节点 10.18.30.12: 记录数 = 1
+节点 10.18.30.13: 记录数 = 1
+
+3. etcd数据一致性:
+节点 10.18.30.11: test_key = test_key
+etcd_value_1761555570
+节点 10.18.30.12: test_key = test_key
+etcd_value_1761555570
+节点 10.18.30.13: test_key = test_key
+etcd_value_1761555570
+=== 集群测试完成 ===

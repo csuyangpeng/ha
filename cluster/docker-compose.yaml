@@ -1,0 +1,93 @@
+services:
+  mysql:
+    image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/mysql:8.0 
+    container_name: mysql
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      MYSQL_ROOT_PASSWORD: s<9!Own1z4 
+      MYSQL_DATABASE: mydb
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/config:/etc/mysql/conf.d
+
+  redis1:
+    image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/redis:6.0.9
+    container_name: redis1
+    network_mode: host
+    volumes:
+      - ./redis/data1:/data
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: [
+      "redis-server",
+      "--requirepass ${REDIS_PASSWORD}",
+      "--masterauth ${REDIS_PASSWORD}",
+      "--cluster-enabled yes",
+      "--cluster-config-file nodes.conf",
+      "--cluster-node-timeout 5000",
+      "--appendonly yes",
+      "--port 6379"
+    ]
+    restart: unless-stopped
+
+  redis2:
+    image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/redis:6.0.9
+    container_name: redis2
+    network_mode: host
+    volumes:
+      - ./redis/data2:/data
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: [
+      "redis-server",
+      "--requirepass ${REDIS_PASSWORD}",
+      "--masterauth ${REDIS_PASSWORD}",
+      "--cluster-enabled yes",
+      "--cluster-config-file nodes.conf",
+      "--cluster-node-timeout 5000",
+      "--appendonly yes",
+      "--port 6380"
+    ]
+    restart: unless-stopped
+
+  etcd:
+    image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/etcd:latest
+    container_name: etcd
+    network_mode: host
+    volumes:
+      - ./etcd/data:/etcd-data
+    environment:
+      - ETCD_NAME=etcd${NODEID}
+      - ETCD_DATA_DIR=/etcd-data
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://${NODEIP}:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://${NODEIP}:2379
+      - ETCD_INITIAL_CLUSTER_TOKEN=my-etcd-cluster
+      - ETCD_INITIAL_CLUSTER=${NODELIST}
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    restart: unless-stopped
+
+  mysqlrouter:
+    image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/mysql-router:8.0.32
+    container_name: mysqlrouter
+    restart: unless-stopped
+    network_mode: host
+      #ports:
+      #- "6446:6446"   # 读写端口
+      #- "6447:6447"   # 只读端口
+      #- "6448:6448"   # 管理端口
+    environment:
+      # 必须的环境变量（用于自动引导）
+      MYSQL_HOST: ${NODEIP}  # 集群中任意节点
+      MYSQL_PORT: "3306"
+      MYSQL_USER: "root"        # 集群root用户
+      MYSQL_PASSWORD: "s<9!Own1z4"  # 集群root密码
+
+      # 可选配置
+      MYSQL_INNODB_CLUSTER_MEMBERS: 3
+      MYSQL_CREATE_ROUTER_USER: "0"  # 自动创建router用户
+        #MYSQL_ROUTER_BOOTSTRAP_EXTRA_OPTIONS: "--account root"  # 直接使用root
+    volumes:
+      - ./mysqlrouter/config/mysqlrouter.conf:/etc/mysqlrouter/mysqlrouter.conf  # 自定义配置

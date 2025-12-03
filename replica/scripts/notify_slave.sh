@@ -22,7 +22,7 @@ docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "RESET MASTER;
 # 4. 指向新的主库（通过VIP，确保始终连接到当前活动主库）
 docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 <<EOF >> $LOG
 CHANGE MASTER TO
-MASTER_HOST='$NEW_MASTER_IP',
+MASTER_HOST='10.18.1.30',
 MASTER_USER='root',
 MASTER_PASSWORD='s<9!Own1z4',
 MASTER_PORT=3306,

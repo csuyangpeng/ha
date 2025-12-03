@@ -1,6 +1,6 @@
 
 #!/bin/bash
-LOG="/var/log/keepalived-mysql.log"
+LOG="/home/sder/ha/replica/logs/keepalived-mysql.log"
 echo "$(date): [NOTIFY] Becoming MASTER. Promoting MySQL..." >> $LOG
 
 # 1. 停止复制线程

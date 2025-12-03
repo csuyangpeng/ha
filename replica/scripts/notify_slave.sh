@@ -1,7 +1,7 @@
 
 #!/bin/bash
 # notify_backup.sh - 当节点成为Keepalived BACKUP时，将MySQL降级为Slave
-LOG="/var/log/keepalived-mysql.log"
+LOG="/home/sder/ha/replica/logs/keepalived-mysql.log"
 NEW_MASTER_IP="10.18.1.30"  # 通过VIP连接，总是指向当前主库
 # 也可以直接指定新主库IP: NEW_MASTER_IP="10.18.1.28"
 MYSQL_USER="root"

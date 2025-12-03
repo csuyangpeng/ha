@@ -1,3 +1,4 @@
+
 services:
   mysql:
     image: registry.cn-hangzhou.aliyuncs.com/10_18_1_2_5000/mysql:8.0 
@@ -6,9 +7,10 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: s<9!Own1z4
     command:
-      - --server-id=1
+      - --server-id=2 # 唯一的服务器ID，主库为1，从库为2及以上
       - --log-bin=mysql-bin
       - --binlog-format=ROW
+      - --expire-logs-days=7
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --log-slave-updates=ON

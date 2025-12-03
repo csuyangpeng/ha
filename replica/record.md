@@ -62,6 +62,7 @@ listening on ens3, link-type EN10MB (Ethernet), snapshot length 262144 bytes
 
 
 ### Mysql
+mysql -uroot -p's<9!Own1z4'
 
 SHOW MASTER STATUS\G
 SHOW SLAVE STATUS\G

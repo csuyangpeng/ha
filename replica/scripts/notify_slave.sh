@@ -1,43 +1,38 @@
 #!/bin/bash
-# notify_backup.sh - 当节点成为Keepalived BACKUP时，将MySQL降级为Slave
-LOG="/home/sder/ha/replica/logs/keepalived-mysql.log"
-NEW_MASTER_IP="10.18.1.30"  # 通过VIP连接，总是指向当前主库
-# 也可以直接指定新主库IP: NEW_MASTER_IP="10.18.1.28"
-MYSQL_USER='root'
-MYSQL_PASS='s<9!Own1z4'
+# /home/sder/ha/replica/scripts/notify_backup_wrapper.sh
 
-echo "$(date): [NOTIFY] Becoming BACKUP. Demoting MySQL to SLAVE..." >> $LOG
+LOG="/home/sder/ha/replica/logs/keepalived-wrapper.log"
 
-# 1. 停止当前的复制进程（如果存在）
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "STOP SLAVE;" >> $LOG
+echo "$(date): [WRAPPER] Starting BACKUP transition" >> $LOG
 
-# . 彻底重置复制状态，清除所有旧的master信息
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "RESET SLAVE ALL;" >> $LOG
+# 1. 先执行 MySQL 降级
+if [ -x "/home/sder/ha/replica/scripts/mysql_notify_slave.sh" ]; then
+    echo "$(date): Executing MySQL slave script..." >> $LOG
+    /home/sder/ha/replica/scripts/mysql_notify_slave.sh >> $LOG 2>&1
+    MYSQL_STATUS=$?
+    echo "$(date): MySQL script exit code: $MYSQL_STATUS" >> $LOG
+fi
 
-# 3. 【关键】如果原主库曾写入数据，需谨慎处理（见下文说明）
-# 方案A（安全）：不清理数据，但需确保GTID或日志位置能接续
-# 方案B（彻底）：清除可能冲突的数据（仅用于测试或可丢失数据的场景）
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "RESET MASTER;" >> $LOG
+# 2. 再执行 Redis 降级
+if [ -x "/home/sder/ha/replica/scripts/redis_notify_slave.sh" ]; then
+    echo "$(date): Executing Redis slave script..." >> $LOG
+    /home/sder/ha/replica/scripts/redis_notify_slave.sh >> $LOG 2>&1
+    REDIS_STATUS=$?
+    echo "$(date): Redis script exit code: $REDIS_STATUS" >> $LOG
+fi
 
-# 4. 指向新的主库（通过VIP，确保始终连接到当前活动主库）
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 <<EOF >> $LOG
-CHANGE MASTER TO
-MASTER_HOST='10.18.1.30',
-MASTER_USER='root',
-MASTER_PASSWORD='s<9!Own1z4',
-MASTER_PORT=3306,
-MASTER_AUTO_POSITION=1,
-MASTER_CONNECT_RETRY=10;
-EOF
+# 3. Etcd 检查（Etcd 不需要特殊操作）
+if [ -x "/home/sder/ha/replica/scripts/etcd_notify_slave.sh" ]; then
+    echo "$(date): Executing Etcd slave script..." >> $LOG
+    /home/sder/ha/replica/scripts/etcd_notify_slave.sh >> $LOG 2>&1
+    ETCD_STATUS=$?
+fi
 
-# 5. 启动复制
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "START SLAVE;" >> $LOG
+echo "$(date): [WRAPPER] BACKUP transition completed" >> $LOG
 
-# 6. 确保本机处于只读状态
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SET GLOBAL read_only=ON;" >> $LOG
-
-# 7. 检查复制状态
-echo "$(date): [NOTIFY] Checking slave status..." >> $LOG
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SHOW SLAVE STATUS\G" >> $LOG | grep -E "Slave_IO_Running|Slave_SQL_Running|Last_Error" >> $LOG
-
-echo "$(date): [NOTIFY] MySQL demotion to SLAVE finished." >> $LOG
+# 如果两个脚本都成功返回 0，否则返回失败代码
+if [ $MYSQL_STATUS -eq 0 ] && [ $REDIS_STATUS -eq 0 ] && [ $ETCD_STATUS -eq 0 ]; then
+    exit 0
+else
+    exit 1
+fi

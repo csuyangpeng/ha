@@ -1,23 +1,37 @@
 #!/bin/bash
-LOG="/home/sder/ha/replica/logs/keepalived-mysql.log"
-echo "$(date): [NOTIFY] Becoming MASTER. Promoting MySQL..." >> $LOG
+# /home/sder/ha/replica/scripts/notify_master_wrapper.sh
 
-MYSQL_USER="root"
-MYSQL_PASS="s<9!Own1z4"
-# 1. 停止复制线程
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "STOP SLAVE;" >> $LOG
+LOG="/home/sder/ha/replica/logs/keepalived-wrapper.log"
 
-# . 重置从库状态，解除与原主的关系
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "RESET SLAVE ALL;" >> $LOG
+echo "$(date): [WRAPPER] Starting MASTER transition" >> $LOG
 
-# 3. 【重要】确保本机可写，成为主库。这是最关键的一步。
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SET GLOBAL read_only=OFF;" >> $LOG
+# 1. 先执行 MySQL 提升
+if [ -x "/home/sder/ha/replica/scripts/mysql_notify_master.sh" ]; then
+    echo "$(date): Executing MySQL master script..." >> $LOG
+    /home/sder/ha/replica/scripts/mysql_notify_master.sh >> $LOG 2>&1
+    MYSQL_STATUS=$?
+    echo "$(date): MySQL script exit code: $MYSQL_STATUS" >> $LOG
+fi
 
-# # 重置master日志状态（可选，适用于计划构建新的复制集群）
-# docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "RESET MASTER;" >> $LOG
+# 2. 再执行 Redis 提升
+if [ -x "/home/sder/ha/replica/scripts/redis_notify_master.sh" ]; then
+    echo "$(date): Executing Redis master script..." >> $LOG
+    /home/sder/ha/replica/scripts/redis_notify_master.sh >> $LOG 2>&1
+    REDIS_STATUS=$?
+    echo "$(date): Redis script exit code: $REDIS_STATUS" >> $LOG
+fi
 
-# 4. 【可选但建议】创建一个新的binlog文件，使日志更清晰。这与 RESET MASTER 完全不同！
-#    FLUSH BINARY LOGS 会关闭当前binlog并新建一个，不会删除任何历史日志。
-docker exec -it mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "FLUSH BINARY LOGS;" >> $LOG
+# 3. Etcd 检查（Etcd 不需要特殊操作）
+if [ -x "/home/sder/ha/replica/scripts/etcd_notify_master.sh" ]; then
+    echo "$(date): Executing Etcd master script..." >> $LOG
+    /home/sder/ha/replica/scripts/etcd_notify_master.sh >> $LOG 2>&1
+    ETCD_STATUS=$?
+fi
 
-echo "$(date): [NOTIFY] MySQL promotion to MASTER finished (binlog history PRESERVED)." >> $LOG
+echo "$(date): [WRAPPER] MASTER transition completed" >> $LOG
+
+if [ $MYSQL_STATUS -eq 0 ] && [ $REDIS_STATUS -eq 0 ]; then
+    exit 0
+else
+    exit 1
+fi

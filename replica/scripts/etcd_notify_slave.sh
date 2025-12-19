@@ -19,13 +19,22 @@ else
     sleep 3
 fi
 
+# stop etcdvip service
+echo "$(date): 停止etcdvip服务..." >> $LOG 2>&1
+cd /home/sder/ha/replica && docker-compose down etcdvip >> $LOG 2>&1
+
+# restart etcd service to ensure proper state
+echo "$(date): 重启etcd服务以确保正确状态..." >> $LOG 2>&1
+cd /home/sder/ha/replica && docker-compose restart etcd >> $LOG 2>&1
+sleep 3
+
 # 2. 显示本机状态
 echo "$(date): 本机etcd状态:" >> $LOG 2>&1
 docker exec etcd etcdctl endpoint status --endpoints=http://${LOCAL_IP}:2379 --write-out=table >> $LOG 2>&1 2>&1 || echo "$(date): 无法获取状态" >> $LOG 2>&1
 
 # 3. 显示集群状态
 echo "$(date): 集群状态:" >> $LOG 2>&1
-docker exec etcd etcdctl endpoint status --endpoints=http://10.18.1.27:2379,http://10.18.1.28:2379 --write-out=table >> $LOG 2>&1 2>&1 || echo "$(date): 无法获取集群状态" >> $LOG 2>&1
+docker exec etcd etcdctl endpoint status --endpoints=http://10.18.1.27:2379,http://10.18.1.28:2379,http://10.18.1.30:23790 --write-out=table >> $LOG 2>&1 2>&1 || echo "$(date): 无法获取集群状态" >> $LOG 2>&1
 
 # 4. 检查是否意外成为leader
 TABLE_OUTPUT=$(docker exec etcd etcdctl endpoint status --endpoints=http://${LOCAL_IP}:2379 --write-out=table 2>/dev/null || echo "")

@@ -8,6 +8,11 @@ MYSQL_PASS='s<9!Own1z4'
 
 echo "$(date): [NOTIFY] Becoming BACKUP. Demoting MySQL to SLAVE..." >> $LOG 2>&1
 
+# 6. 确保本机处于只读状态
+docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SET GLOBAL read_only=ON;SET GLOBAL super_read_only=ON;" >> $LOG 2>&1
+
+docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SHOW MASTER STATUS\G SHOW SLAVE STATUS\G" >> $LOG 2>&1
+
 # 1. 停止当前的复制进程（如果存在）
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "STOP SLAVE;" >> $LOG 2>&1
 
@@ -32,9 +37,6 @@ EOF
 
 # 5. 启动复制
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "START SLAVE;" >> $LOG 2>&1
-
-# 6. 确保本机处于只读状态
-docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SET GLOBAL read_only=ON;SET GLOBAL super_read_only=ON;" >> $LOG 2>&1
 
 # 7. 检查复制状态
 echo "$(date): [NOTIFY] Checking slave status..." >> $LOG 2>&1

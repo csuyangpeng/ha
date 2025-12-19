@@ -74,7 +74,7 @@ services:
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://10.18.1.27:2380
       - ETCD_INITIAL_CLUSTER=etcd1=http://10.18.1.27:2380,etcd2=http://10.18.1.28:2380,etcdvip=http://10.18.1.30:23800
       - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-token
-      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_STATE=${ETCD_CLUSTER_STATE:-existing}
       - ETCD_CLIENT_CERT_AUTH=true
       - ETCD_PEER_CLIENT_CERT_AUTH=true
     command: /usr/local/bin/etcd
@@ -97,26 +97,29 @@ services:
     restart: unless-stopped
     environment:
       - ETCD_NAME=etcdvip
-      - ETCD_DATA_DIR=/etcd-data
+      # - ETCD_DATA_DIR=/etcd-data
       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:23790
       - ETCD_ADVERTISE_CLIENT_URLS=http://10.18.1.30:23790
       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:23800
       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://10.18.1.30:23800
       - ETCD_INITIAL_CLUSTER=etcd1=http://10.18.1.27:2380,etcd2=http://10.18.1.28:2380,etcdvip=http://10.18.1.30:23800
       - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-token
-      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_STATE=${ETCD_CLUSTER_STATE:-existing}
       - ETCD_CLIENT_CERT_AUTH=true
       - ETCD_PEER_CLIENT_CERT_AUTH=true
-    command: /usr/local/bin/etcd
-    volumes:
-      - ./data/etcdvip:/etcd-data
-      - ./logs:/var/log/etcd
+      - ETCD_LEARNER=true
+    command: 
+      - /usr/local/bin/etcd
+      - --force-new-cluster=false
+    # volumes:
+    #   - ./data/etcdvip:/etcd-data
+    #   - ./logs:/var/log/etcd
     network_mode: host
     # ports:
     #   - "2379:2379"
     #   - "2380:2380"
     healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:23790", "endpoint", "health"]
       interval: 10s
       timeout: 5s
       retries: 3

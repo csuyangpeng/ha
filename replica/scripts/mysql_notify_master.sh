@@ -6,6 +6,9 @@ echo "$(date): [NOTIFY] Becoming MASTER. Promoting MySQL..." >> $LOG 2>&1
 
 MYSQL_USER="root"
 MYSQL_PASS="s<9!Own1z4"
+
+docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "SHOW MASTER STATUS\G SHOW SLAVE STATUS\G" >> $LOG 2>&1
+
 # 1. 停止复制线程
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -h 127.0.0.1 -e "STOP SLAVE;" >> $LOG 2>&1
 

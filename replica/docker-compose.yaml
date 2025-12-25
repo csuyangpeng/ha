@@ -48,9 +48,11 @@ services:
       "--repl-timeout", "60",
       "--repl-diskless-sync", "no",
       "--loglevel", "notice",
+      "--logfile", "/logs/redis.log",
     ]
     volumes:
       - ./data/redis:/data
+      - ./logs:/logs
       - ./config/redis.conf:/usr/local/etc/redis/redis.conf
     network_mode: host
     # ports:

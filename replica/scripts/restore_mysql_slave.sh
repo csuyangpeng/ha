@@ -8,12 +8,13 @@ MASTER_IP="10.18.1.28"
 SLAVE_IP="10.18.1.27"
 MYSQL_PASS='s<9!Own1z4'
 BACKUP_FILE="/tmp/master_dump.sql"
+LOCAL_FILE="/tmp/master_dump_local.sql"
 
 echo "=== 恢复 $SLAVE_IP MySQL 从库 ==="
 
 # 1. 在主库创建备份
 echo "1. 在主库 ($MASTER_IP) 创建备份..." 2>&1 | _ts_pipe >> "$LOG"
-ssh $MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
+ssh sder@$MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
   --all-databases \
   --single-transaction \
   --master-data=2 \
@@ -22,7 +23,8 @@ ssh $MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
 
 # 2. 复制备份文件
 echo "2. 复制备份文件到从库..." 2>&1 | _ts_pipe >> "$LOG"
-scp $MASTER_IP:$BACKUP_FILE $BACKUP_FILE 2>&1 | _ts_pipe >> "$LOG"
+sudo rm -rf $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
+scp sder@$MASTER_IP:$BACKUP_FILE $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
 
 # 3. 停止从库 MySQL
 echo "3. 停止从库 MySQL 容器..." 2>&1 | _ts_pipe >> "$LOG"
@@ -51,10 +53,12 @@ until docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/nu
   sleep 3
 done
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
+sleep 3
+docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
 
 # 6. 导入数据
 echo "6. 导入数据..." 2>&1 | _ts_pipe >> "$LOG"
-docker cp $BACKUP_FILE mysql:/tmp/dump.sql 2>&1 | _ts_pipe >> "$LOG"
+docker cp $LOCAL_FILE mysql:/tmp/dump.sql 2>&1 | _ts_pipe >> "$LOG"
 docker exec mysql bash -c "mysql -uroot -p's<9!Own1z4' < /tmp/dump.sql" 2>&1 | _ts_pipe >> "$LOG"
 
 # 7. 配置复制
@@ -66,7 +70,7 @@ STOP SLAVE;
 RESET SLAVE ALL;
 
 CHANGE MASTER TO
-  MASTER_HOST='$MASTER_IP',
+  MASTER_HOST='10.18.1.28',
   MASTER_USER='root',
   MASTER_PASSWORD='s<9!Own1z4',
   MASTER_PORT=3306,

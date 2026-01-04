@@ -23,14 +23,14 @@ ssh sder@$MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
 
 # 2. 复制备份文件
 echo "2. 复制备份文件到从库..." 2>&1 | _ts_pipe >> "$LOG"
-sudo rm -rf $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
+rm -rf $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
 scp sder@$MASTER_IP:$BACKUP_FILE $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
 
 # 3. 停止从库 MySQL
 echo "3. 停止从库 MySQL 容器..." 2>&1 | _ts_pipe >> "$LOG"
 docker stop mysql 2>&1 | _ts_pipe >> "$LOG"
 docker rm mysql 2>&1 | _ts_pipe >> "$LOG"
-sudo rm -rf /home/sder/ha/replica/data/mysql/*  2>&1 | _ts_pipe >> "$LOG"
+rm -rf /home/sder/ha/replica/data/mysql/*  2>&1 | _ts_pipe >> "$LOG"
 # docker volume rm mysql_data 2>/dev/null || true
 
 # 4. 重新创建容器
@@ -52,8 +52,10 @@ until docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/nu
   echo "等待 MySQL 启动..." 2>&1 | _ts_pipe >> "$LOG"
   sleep 3
 done
-docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
-sleep 3
+until docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/null; do
+  echo "等待 MySQL 启动..." 2>&1 | _ts_pipe >> "$LOG"
+  sleep 3
+done
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
 
 # 6. 导入数据

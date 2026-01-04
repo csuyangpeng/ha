@@ -2,6 +2,7 @@
 
 source "/home/sder/ha/replica/scripts/base.sh"
 
+echo "0" > "$THRESHOLD_FILE"
 echo "[NOTIFY] Becoming MASTER. Promoting MySQL..." 2>&1 | _ts_pipe >> "$LOG"
 
 MYSQL_USER="root"

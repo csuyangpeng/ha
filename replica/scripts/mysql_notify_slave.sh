@@ -5,6 +5,7 @@ source "/home/sder/ha/replica/scripts/base.sh"
 NEW_MASTER_IP="10.18.1.30"  # 通过VIP连接，总是指向当前主库
 # 也可以直接指定新主库IP: NEW_MASTER_IP="10.18.1.28"
 
+echo "0" > "$THRESHOLD_FILE"
 echo "[NOTIFY] Becoming BACKUP. Demoting MySQL to SLAVE..." 2>&1 | _ts_pipe >> "$LOG"
 
 # 6. 确保本机处于只读状态

@@ -1,6 +1,7 @@
 
 ### keepalived 配置文件示例
 #### 10.18.1.27
+```
 sder@sder:/etc/keepalived$ cat keepalived.conf
 global_defs {
     route_id 1b01
@@ -25,10 +26,10 @@ vrrp_instance VI_1 {
         10.18.1.30
     }
 }
-
+```
 
 #### 10.18.1.28  
-
+```
 sder@sder:/etc/keepalived$ cat keepalived.conf
 global_defs {
     route_id 1b01
@@ -60,8 +61,16 @@ listening on ens3, link-type EN10MB (Ethernet), snapshot length 262144 bytes
 11:54:26.377859 IP 10.18.1.27 > 10.18.1.28: VRRPv2, Advertisement, vrid 51, prio 150, authtype simple, intvl 1s, length 20
 11:54:27.378129 IP 10.18.1.27 > 10.18.1.28: VRRPv2, Advertisement, vrid 51, prio 150, authtype simple, intvl 1s, length 20
 
+sder@sder:~$ sudo tcpdump -i ens3 -n vrrp -vvv
+tcpdump: listening on ens3, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+16:21:10.654438 IP (tos 0xc0, ttl 255, id 41839, offset 0, flags [none], proto VRRP (112), length 40)
+    10.18.1.27 > 10.18.1.28: VRRPv2, Advertisement, vrid 251, prio 100, authtype simple, intvl 1s, length 20, addrs: 10.18.1.30 auth "1111"
+16:21:11.654740 IP (tos 0xc0, ttl 255, id 41840, offset 0, flags [none], proto VRRP (112), length 40)
+    10.18.1.27 > 10.18.1.28: VRRPv2, Advertisement, vrid 251, prio 100, authtype simple, intvl 1s, length 20, addrs: 10.18.1.30 auth "1111"
+```
 
 ### Mysql
+```
 mysql -uroot -p's<9!Own1z4'
 
 SHOW MASTER STATUS\G
@@ -75,4 +84,4 @@ MASTER_USER='root',
 MASTER_PASSWORD='s<9!Own1z4',
 MASTER_AUTO_POSITION=1;
 START SLAVE;
-
+```

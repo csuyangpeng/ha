@@ -13,7 +13,7 @@ MYSQL_PASS="s<9!Own1z4"
 
 LOCK_FILE="/var/run/mysql_backup.lock"
 THRESHOLD_FILE="/var/run/threshold_count"
-THRESHOLD=3  # 阈值，达到3次才执行
+THRESHOLD=1  # 阈值，达到3次才执行
 
 MYSQL_VIP="10.18.1.30"
 NODE1="10.18.1.27"

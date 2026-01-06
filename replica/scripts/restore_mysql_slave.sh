@@ -19,6 +19,7 @@ ssh sder@$MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
   --single-transaction \
   --master-data=2 \
   --set-gtid-purged=ON \
+  --routines \
   > $BACKUP_FILE" 2>&1 | _ts_pipe >> "$LOG"
 
 # 2. 复制备份文件

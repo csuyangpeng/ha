@@ -7,8 +7,12 @@ echo "=== 执行主库切换测试 ==="
 echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
 
 # 获取当前主库
-get_current_master() {
+get_current_slave() {
     for node in "${KEEPALIVED_NODES[@]}"; do
+        # 检查 $node 上的 MySQL 实例是否为从库（replica）。
+        # 通过执行 "SHOW SLAVE STATUS" 并查找输出中的 "Master_Host" 字段：
+        # - 若存在 "Master_Host"，说明该节点是从库并指向某个主库，if 条件为真。
+        # - 标准错误被重定向到 /dev/null，grep -q 用于静默匹配。
         if mysql -h $node -u $MYSQL_USER -p$MYSQL_PASS -e "SHOW SLAVE STATUS" 2>/dev/null | grep -q "Master_Host"; then
             echo $node
             return
@@ -18,11 +22,11 @@ get_current_master() {
     echo ${KEEPALIVED_NODES[0]}
 }
 
-CURRENT_MASTER=$(get_current_master)
-BACKUP_NODE=""
+BACKUP_NODE=$(get_current_slave)
+CURRENT_MASTER=""
 for node in "${KEEPALIVED_NODES[@]}"; do
-    if [ "$node" != "$CURRENT_MASTER" ]; then
-        BACKUP_NODE=$node
+    if [ "$node" != "$BACKUP_NODE" ]; then
+        CURRENT_MASTER=$node
         break
     fi
 done

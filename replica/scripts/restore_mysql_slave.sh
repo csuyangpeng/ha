@@ -1,92 +1,97 @@
 #!/bin/bash
-# restore_mysql_slave.sh
+# 从当前主库（VIP）全量重建本机 MySQL 从库
+# 仅应在 BACKUP 节点执行；导出成功后才允许清空本地数据目录。
+set -euo pipefail
 
 source "/home/sder/ha/replica/scripts/base.sh"
 
-# 配置
-MASTER_IP="10.18.1.28"
-SLAVE_IP="10.18.1.27"
-MYSQL_PASS='s<9!Own1z4'
+MASTER_IP="$MYSQL_VIP"
 BACKUP_FILE="/tmp/master_dump.sql"
 LOCAL_FILE="/tmp/master_dump_local.sql"
 
-echo "=== 恢复 $SLAVE_IP MySQL 从库 ==="
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
-# 1. 在主库创建备份
-echo "1. 在主库 ($MASTER_IP) 创建备份..." 2>&1 | _ts_pipe >> "$LOG"
-ssh sder@$MASTER_IP "docker exec mysql mysqldump -uroot -p's<9!Own1z4' \
-  --all-databases \
-  --single-transaction \
-  --master-data=2 \
-  --set-gtid-purged=ON \
-  --routines \
-  | sed '\$ a\\
-FLUSH PRIVILEGES;' \
-  > $BACKUP_FILE" 2>&1 | _ts_pipe >> "$LOG"
+if is_on_vip; then
+    log "[RESTORE] 本机持有 VIP，拒绝重建（应在 BACKUP 节点执行）"
+    exit 1
+fi
 
-# 2. 复制备份文件
-echo "2. 复制备份文件到从库..." 2>&1 | _ts_pipe >> "$LOG"
-rm -rf $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
-scp sder@$MASTER_IP:$BACKUP_FILE $LOCAL_FILE 2>&1 | _ts_pipe >> "$LOG"
+log "=== 开始重建本机 MySQL 从库（源: ${MASTER_IP}）==="
 
-# 3. 停止从库 MySQL
-echo "3. 停止从库 MySQL 容器..." 2>&1 | _ts_pipe >> "$LOG"
-docker stop mysql 2>&1 | _ts_pipe >> "$LOG"
-docker rm mysql 2>&1 | _ts_pipe >> "$LOG"
-rm -rf /home/sder/ha/replica/data/mysql/*  2>&1 | _ts_pipe >> "$LOG"
-# docker volume rm mysql_data 2>/dev/null || true
+# 1. 在主库上导出（通过 ssh 进入对端容器，避免依赖本机 mysql 客户端）
+log "1. 在主库 ${MASTER_IP} 导出全量备份"
+ssh "sder@${MASTER_IP}" "docker exec mysql mysqldump -uroot -p'${MYSQL_PASS}' \
+  --all-databases --single-transaction --master-data=2 --set-gtid-purged=ON \
+  --routines --events > ${BACKUP_FILE}" >> "$LOG" 2>&1
 
-# 4. 重新创建容器
-echo "4. 重新创建 MySQL 容器..." 2>&1 | _ts_pipe >> "$LOG"
-pushd /home/sder/ha/replica && docker-compose up -d mysql && popd  2>&1 | _ts_pipe >> "$LOG"
-# docker run -d \
-#   --name mysql \
-#   -e MYSQL_ROOT_PASSWORD='s<9!Own1z4' \
-#   -v mysql_data:/var/lib/mysql \
-#   -p 3306:3306 \
-#   mysql:8.0 \
-#   --server-id=2
+# 2. 拉回本地并校验
+log "2. 复制备份文件到本机"
+scp -q "sder@${MASTER_IP}:${BACKUP_FILE}" "$LOCAL_FILE" >> "$LOG" 2>&1
+if [ ! -s "$LOCAL_FILE" ]; then
+    log "[RESTORE] 备份文件为空，终止（未修改本地数据）"
+    exit 1
+fi
+log "   备份大小: $(du -h "$LOCAL_FILE" | awk '{print $1}')"
 
-# 5. 等待启动
-echo "5. 等待 MySQL 启动..." 2>&1 | _ts_pipe >> "$LOG"
+# 3. 停止并重建 MySQL 容器
+log "3. 停止本地 MySQL 并清空数据目录"
+docker stop mysql >> "$LOG" 2>&1 || true
+docker rm mysql >> "$LOG" 2>&1 || true
+rm -rf "${REPLICA_DIR:?}/data/mysql/"*
 
-# wait until mysql is ready
-until docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/null; do
-  echo "等待 MySQL 启动..." 2>&1 | _ts_pipe >> "$LOG"
-  sleep 3
+log "4. 重新创建 MySQL 容器"
+( cd "$REPLICA_DIR" && docker compose up -d mysql ) >> "$LOG" 2>&1
+
+log "5. 等待 MySQL 就绪"
+READY=0
+for _ in $(seq 1 60); do
+    if mysql_alive; then READY=1; break; fi
+    sleep 3
 done
-until docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/null; do
-  echo "等待 MySQL 启动..." 2>&1 | _ts_pipe >> "$LOG"
-  sleep 3
-done
-docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
+if [ "$READY" -ne 1 ]; then
+    log "[RESTORE] MySQL 启动超时"
+    exit 1
+fi
 
 # 6. 导入数据
-echo "6. 导入数据..." 2>&1 | _ts_pipe >> "$LOG"
-docker cp $LOCAL_FILE mysql:/tmp/dump.sql 2>&1 | _ts_pipe >> "$LOG"
-docker exec mysql bash -c "mysql -uroot -p's<9!Own1z4' < /tmp/dump.sql" 2>&1 | _ts_pipe >> "$LOG"
+log "6. 导入数据"
+docker exec -i mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" < "$LOCAL_FILE" >> "$LOG" 2>&1
 
-# 7. 配置复制
-echo "7. 配置复制..." 2>&1 | _ts_pipe >> "$LOG"
-docker exec -i mysql mysql -uroot -p's<9!Own1z4' << EOF 2>&1 | _ts_pipe >> "$LOG"
-SET GLOBAL read_only=ON;SET GLOBAL super_read_only=ON;
+# 7. 配置复制（源为 VIP），并置只读
+log "7. 配置复制"
+mysql_exec <<EOF >> "$LOG" 2>&1
+SET GLOBAL read_only=ON;
+SET GLOBAL super_read_only=ON;
 STOP SLAVE;
-# RESET MASTER;
 RESET SLAVE ALL;
-
 CHANGE MASTER TO
-  MASTER_HOST='10.18.1.28',
-  MASTER_USER='root',
-  MASTER_PASSWORD='s<9!Own1z4',
-  MASTER_PORT=3306,
+  MASTER_HOST='${MASTER_IP}',
+  MASTER_USER='${MYSQL_USER}',
+  MASTER_PASSWORD='${MYSQL_PASS}',
+  MASTER_PORT=${MYSQL_PORT},
   MASTER_AUTO_POSITION=1,
   MASTER_CONNECT_RETRY=10;
-
 START SLAVE;
 EOF
 
-# 8. 检查状态
-echo "8. 检查状态..." 2>&1 | _ts_pipe >> "$LOG"
-docker exec mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" 2>&1 | _ts_pipe >> "$LOG"
+# 8. 校验
+log "8. 校验复制状态"
+for _ in $(seq 1 30); do
+    STATUS=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+    IO_RUNNING=$(echo "$STATUS" | awk -F': ' '/Slave_IO_Running:/{print $2}')
+    SQL_RUNNING=$(echo "$STATUS" | awk -F': ' '/Slave_SQL_Running:/{print $2}')
+    [ "$IO_RUNNING" = "Yes" ] && [ "$SQL_RUNNING" = "Yes" ] && break
+    sleep 2
+done
+echo "$STATUS" >> "$LOG"
 
-echo "✅ 恢复完成！" 2>&1 | _ts_pipe >> "$LOG"
+rm -f "$BACKUP_FILE" 2>/dev/null || true
+ssh "sder@${MASTER_IP}" "rm -f ${BACKUP_FILE}" >> "$LOG" 2>&1 || true
+
+if [ "$IO_RUNNING" = "Yes" ] && [ "$SQL_RUNNING" = "Yes" ]; then
+    log "=== 重建完成：复制正常 ==="
+    exit 0
+fi
+
+log "[RESTORE] 重建后复制仍未建立（IO=${IO_RUNNING:-N/A}, SQL=${SQL_RUNNING:-N/A}）"
+exit 1

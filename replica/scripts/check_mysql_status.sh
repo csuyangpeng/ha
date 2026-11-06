@@ -1,153 +1,131 @@
 #!/bin/bash
-# /etc/keepalived/scripts/check_mysql_status.sh
+# keepalived vrrp_script 健康检查
+#
+# 约定（重要）：
+#   MASTER（持有 VIP）：MySQL 不可用或不可写 -> exit 1，释放 VIP 触发切换；
+#   BACKUP（未持有 VIP）：只记录/告警，始终 exit 0。若备节点返回失败会进入
+#   FAULT 状态，反而无法在主库故障时接管。
+source "/home/sder/ha/replica/scripts/base.sh"
 
-source /home/sder/ha/replica/scripts/base.sh
+MAIL_TO="peng.yang@kingsignal.com"
 
-# 获取当前 Keepalived 状态
-get_keepalived_role() {
-    if ip addr show ens3 | grep -q "10.18.1.30"; then
-        echo "MASTER"
-    else
-        echo "SLAVE"
+log() {
+    echo "[$(date '+%F %T')] $*" >> "$LOG"
+}
+
+# 限频日志：同一 key 每 interval 秒最多写一条
+log_limited() {
+    local key=$1 interval=$2 msg=$3 f now last
+    f="/var/run/replica_log_${key}"
+    now=$(date +%s)
+    last=$(cat "$f" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge "$interval" ]; then
+        echo "$now" > "$f"
+        log "$msg"
     fi
 }
 
-# 检查 MySQL 连接
-check_mysql_connect() {
-    docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" 2>&1 | _ts_pipe >> "$LOG"
-
-    if docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT 1;" &> /dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# 检查 MySQL 主库状态
-check_mysql_master() {
-    READ_ONLY=$(docker exec -i mysql mysql -uroot -p's<9!Own1z4' -N -e "SELECT @@global.read_only;" 2>/dev/null)
-    if [ "$READ_ONLY" = "0" ]; then
-        echo "MySQL 主库状态正常（可写）" 2>&1 | _ts_pipe >> "$LOG"
-        return 0
-    else
-        echo "MySQL 主库异常：处于只读状态" 2>&1 | _ts_pipe >> "$LOG"
-        return 1
-    fi
-}
-
-# 检查 MySQL 从库状态
-check_mysql_slave() {
-    SLAVE_STATUS=$(docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" 2>/dev/null)
-    
-    if [ $? -ne 0 ]; then
-        echo "无法获取从库状态" 2>&1 | _ts_pipe >> "$LOG"
-        return 1
-    fi
-    
-    # 检查复制是否运行
-    IO_RUNNING=$(echo "$SLAVE_STATUS" | grep "Slave_IO_Running:" | awk '{print $2}')
-    SQL_RUNNING=$(echo "$SLAVE_STATUS" | grep "Slave_SQL_Running:" | awk '{print $2}')
-    SECONDS_BEHIND=$(echo "$SLAVE_STATUS" | grep "Seconds_Behind_Master:" | awk '{print $2}')
-
-    if [ "$IO_RUNNING" = "Yes" ] && [ "$SQL_RUNNING" = "Yes" ]; then
-        echo "MySQL 从库状态正常（IO: $IO_RUNNING, SQL: $SQL_RUNNING, 延迟: ${SECONDS_BEHIND:-N/A}秒）" 2>&1 | _ts_pipe >> "$LOG"
-        return 0
-    else
-        echo "MySQL 从库异常：IO_Running=$IO_RUNNING, SQL_Running=$SQL_RUNNING" 2>&1 | _ts_pipe >> "$LOG"
-        return 1
-    fi
-}
-
-# 发送通知
 send_notification() {
-    local role=$1
-    local status=$2
-    local message=$3
-    
-    # 邮件通知
-    echo "$message" | mail -s "Keepalived MySQL 告警 - $(hostname) - $role" peng.yang@kingsignal.com
-    
-    # 日志记录
-    echo "通知已发送：$message" 2>&1 | _ts_pipe >> "$LOG"
-    
-    # 也可以集成到其他告警系统
-    # curl -X POST https://your-webhook.url -d "{\"message\":\"$message\"}"
+    local role=$1 level=$2 message=$3
+    log "[$level] $message"
+    if command -v mail >/dev/null 2>&1; then
+        echo "$message" | mail -s "Replica 告警 - ${LOCAL_IP} - ${role}" "$MAIL_TO"
+    fi
 }
 
-# 主逻辑
+# 限频告警：BACKUP 侧异常可能持续存在，避免每 5 秒发一次
+notify_limited() {
+    local key=$1 interval=$2 role=$3 level=$4 message=$5
+    local f now last
+    f="/var/run/replica_notify_${key}"
+    now=$(date +%s)
+    last=$(cat "$f" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge "$interval" ]; then
+        echo "$now" > "$f"
+        send_notification "$role" "$level" "$message"
+    fi
+}
+
+# 提升进行中（持有 VIP 但仍只读属于正常过渡）
+in_promotion() {
+    [ -f "$PROMOTE_FLAG" ] || return 1
+    local started age
+    started=$(cat "$PROMOTE_FLAG" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - started ))
+    [ "$age" -ge 0 ] && [ "$age" -lt 120 ]
+}
+
+# 从库重建：异步执行 + 限频，避免拖住 keepalived 的健康检查
+schedule_restore() {
+    local now last
+    now=$(date +%s)
+    last=$(cat "$RESTORE_TS_FILE" 2>/dev/null || echo 0)
+    if [ $((now - last)) -lt "$RESTORE_INTERVAL" ]; then
+        log_limited restore_wait 300 "距上次重建不足 ${RESTORE_INTERVAL}s，跳过"
+        return 0
+    fi
+    echo "$now" > "$RESTORE_TS_FILE"
+    log "异步执行从库重建：$SCRIPT_DIR/restore_mysql_slave.sh"
+    setsid "$SCRIPT_DIR/restore_mysql_slave.sh" >> "$LOG" 2>&1 < /dev/null &
+}
 
 main() {
-  # sleep 15
-  {
-    if [ -f "$LOCK_FILE" ]; then
-        echo "[LINE:$LINENO]另一个备份任务正在运行，跳过本次备份" 2>&1 | _ts_pipe >> "$LOG"
-        exit 0
-    fi
+    # 防止重叠执行；进程退出自动释放，不会像普通锁文件那样残留
+    exec 9>"$LOCK_FILE" || exit 0
+    flock -n 9 || { log "上一次检查仍在运行，跳过"; exit 0; }
 
-    touch "$LOCK_FILE"
-    echo "[LINE:$LINENO]create $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
+    local role=MASTER
+    is_on_vip || role=BACKUP
 
-    # 读取 LOCK_FILE 的内容
-    if [ -f "$THRESHOLD_FILE" ]; then
-        COUNT=$(cat "$THRESHOLD_FILE")
-    else
-        echo "0" > "$THRESHOLD_FILE"
-        rm -f "$LOCK_FILE"
-        echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
-        exit 0
-    fi
-
-    if [ "$COUNT" -lt "$THRESHOLD" ]; then        
-        echo "[LINE:$LINENO]当前阈值计数为 $COUNT，未达到执行条件，跳过本次检查" 2>&1 | _ts_pipe >> "$LOG"
-        COUNT=$((COUNT + 1))
-        echo "$COUNT" > "$THRESHOLD_FILE"
-        rm -f "$LOCK_FILE"
-        echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
-        exit 0
-    else
-        # 达到阈值，重置计数
-        echo "0" > "$THRESHOLD_FILE"
-        echo "[LINE:$LINENO]达到阈值计数 $THRESHOLD， 执行检查" 2>&1 | _ts_pipe >> "$LOG"
-    fi
-
-    ROLE=$(get_keepalived_role)
-    
-    # 检查 MySQL 连接
-    if ! check_mysql_connect; then
-        echo "[LINE:$LINENO]MySQL 连接失败" 2>&1 | _ts_pipe >> "$LOG"
-        if [ "$ROLE" = "MASTER" ]; then
-            send_notification "$ROLE" "ERROR" "MySQL 连接失败！VIP: 10.18.1.30，主机: $(hostname)"
+    # ---- MySQL 进程不可用 ----
+    if ! mysql_alive; then
+        log "MySQL 不可用（role=${role}）"
+        if [ "$role" = "MASTER" ]; then
+            send_notification "$role" "ERROR" "MySQL 不可用，释放 VIP 触发切换（${LOCAL_IP}）"
+            exit 1
         fi
-        rm -f "$LOCK_FILE"
-        echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
         exit 0
     fi
-    
-    # 根据角色检查不同状态
-    if [ "$ROLE" = "MASTER" ]; then
-        if ! check_mysql_master; then
-            send_notification "$ROLE" "WARNING" "MySQL 主库状态异常！可能处于只读模式"
-            rm -f "$LOCK_FILE"
-            echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
-            exit 0
+
+    if [ "$role" = "MASTER" ]; then
+        local ro sro
+        ro=$(mysql_query "SELECT @@global.read_only")
+        sro=$(mysql_query "SELECT @@global.super_read_only")
+
+        if [ "$ro" != "0" ] || [ "$sro" != "0" ]; then
+            if in_promotion; then
+                log_limited promotion 60 "提升进行中（read_only=${ro}），暂不判定失败"
+                exit 0
+            fi
+            send_notification "$role" "ERROR" "MASTER 处于只读状态（read_only=${ro}, super_read_only=${sro}），释放 VIP"
+            exit 1
         fi
-    else
-        if ! check_mysql_slave; then
-            echo "[LINE:$LINENO]从库复制异常，准备执行恢复脚本" 2>&1 | _ts_pipe >> "$LOG"
-            /home/sder/ha/replica/scripts/restore_mysql_slave.sh
-            rm -f "$LOCK_FILE"   
-            echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"     
-            exit 0
-        fi
+
+        log_limited master_ok 300 "MASTER 检查通过（可写）"
+        exit 0
     fi
-    
-    echo "[LINE:$LINENO]MySQL 状态检查通过，角色: $ROLE" 2>&1 | _ts_pipe >> "$LOG"
-    rm -f "$LOCK_FILE"
-    echo "[LINE:$LINENO]remove $LOCK_FILE" 2>&1 | _ts_pipe >> "$LOG"
+
+    # ---- BACKUP：只看复制健康，不返回失败 ----
+    local status io sql_r lag
+    status=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)
+    if [ -z "$status" ]; then
+        notify_limited no_slave 300 "$role" "WARNING" "BACKUP 未配置复制关系（${LOCAL_IP}），准备重建"
+        schedule_restore
+        exit 0
+    fi
+
+    io=$(echo "$status" | awk -F': ' '/Slave_IO_Running:/{print $2}')
+    sql_r=$(echo "$status" | awk -F': ' '/Slave_SQL_Running:/{print $2}')
+    lag=$(echo "$status" | awk -F': ' '/Seconds_Behind_Master:/{print $2}')
+
+    if [ "$io" != "Yes" ] || [ "$sql_r" != "Yes" ]; then
+        notify_limited repl_broken 300 "$role" "WARNING" "BACKUP 复制异常（IO=${io:-N/A}, SQL=${sql_r:-N/A}），准备重建"
+        schedule_restore
+        exit 0
+    fi
+
+    log_limited backup_ok 300 "BACKUP 检查通过（IO=${io}, SQL=${sql_r}, 延迟=${lag:-N/A}s）"
     exit 0
-  }
-  exit 0
 }
 
-# 运行主逻辑
 main

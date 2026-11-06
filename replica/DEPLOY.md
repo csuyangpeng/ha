@@ -96,8 +96,31 @@
 
 ```bash
 # 时间必须一致（GTID、etcd 选举都依赖时钟）
-sudo timedatectl set-ntp true
+# 注意：两台当前的授时实现不同，见下方说明
 timedatectl status
+ntpq -pn 2>/dev/null || timedatectl show-timesync
+```
+
+**授时实现差异（2026-11-06 核实）**：
+
+| 节点 | 实现 | 状态 | 检查命令 |
+|---|---|---|---|
+| 10.18.1.27 | 经典 `ntpd`（`ntp` 包） | active，已同步（`*time.neu.edu.cn`，offset 约 -3ms） | `ntpq -pn` |
+| 10.18.1.28 | `systemd-timesyncd` | active，已同步 | `timedatectl show-timesync` |
+
+因此在 **.27 上执行 `sudo timedatectl set-ntp true` 会报 `Failed to set ntp: NTP not supported`** —— 该命令只控制系统 `systemd-timesyncd`，而 .27 的 timesyncd 处于 masked 且二进制已随包移除（`dpkg -l systemd-timesyncd` 显示 `rc`）。**这不代表没有 NTP，`ntpd` 已在正常授时，无需处理**。
+
+两台实测时钟差 < 30ms。若要统一工具链（可选，二选一，不要并存）：
+
+```bash
+# 方案 A（保持 .27 现状）：什么都不做，用 ntpq -pn 验证
+# 方案 B：.27 切到 systemd-timesyncd
+sudo apt install -y systemd-timesyncd
+sudo systemctl disable --now ntp
+sudo systemctl unmask systemd-timesyncd
+sudo systemctl enable --now systemd-timesyncd
+sudo timedatectl set-ntp true
+```
 
 # 确认网卡名与 IP（本环境 ens3）
 ip -o -4 addr show ens3

@@ -95,32 +95,9 @@
 ### 2.1 基础环境
 
 ```bash
-# 时间必须一致（GTID、etcd 选举都依赖时钟）
-# 注意：两台当前的授时实现不同，见下方说明
+# 时间同步（无外网方案见 2.5）
 timedatectl status
-ntpq -pn 2>/dev/null || timedatectl show-timesync
-```
-
-**授时实现差异（2026-11-06 核实）**：
-
-| 节点 | 实现 | 状态 | 检查命令 |
-|---|---|---|---|
-| 10.18.1.27 | 经典 `ntpd`（`ntp` 包） | active，已同步（`*time.neu.edu.cn`，offset 约 -3ms） | `ntpq -pn` |
-| 10.18.1.28 | `systemd-timesyncd` | active，已同步 | `timedatectl show-timesync` |
-
-因此在 **.27 上执行 `sudo timedatectl set-ntp true` 会报 `Failed to set ntp: NTP not supported`** —— 该命令只控制系统 `systemd-timesyncd`，而 .27 的 timesyncd 处于 masked 且二进制已随包移除（`dpkg -l systemd-timesyncd` 显示 `rc`）。**这不代表没有 NTP，`ntpd` 已在正常授时，无需处理**。
-
-两台实测时钟差 < 30ms。若要统一工具链（可选，二选一，不要并存）：
-
-```bash
-# 方案 A（保持 .27 现状）：什么都不做，用 ntpq -pn 验证
-# 方案 B：.27 切到 systemd-timesyncd
-sudo apt install -y systemd-timesyncd
-sudo systemctl disable --now ntp
-sudo systemctl unmask systemd-timesyncd
-sudo systemctl enable --now systemd-timesyncd
-sudo timedatectl set-ntp true
-```
+timedatectl show-timesync 2>/dev/null | grep -E 'ServerName|ServerAddress'
 
 # 确认网卡名与 IP（本环境 ens3）
 ip -o -4 addr show ens3
@@ -141,6 +118,7 @@ sudo systemctl enable keepalived
 
 ```bash
 sudo ufw allow 112/udp          # VRRP（unicast）
+sudo ufw allow 123/udp          # 内部 NTP（见 2.5）
 sudo ufw allow 3306/tcp
 sudo ufw allow 6379/tcp
 sudo ufw allow 2379,2380/tcp
@@ -174,6 +152,128 @@ ssh-copy-id sder@10.18.1.28                        # .27 上执行
 ssh-copy-id sder@10.18.1.27                        # .28 上执行
 ssh 10.18.1.28 docker ps                           # 验证免密 + docker 权限
 ```
+
+### 2.5 时间同步（无外网方案）
+
+#### 现状与问题
+
+2026-11-06 实测：两台都是 `systemd-timesyncd`，上游均为公网 `ntp.ubuntu.com`（DNS 轮询，各自解析到不同 IP）。内网候选 `10.18.1.254`（网关）、`10.18.1.1`、`10.18.1.2`、`10.18.1.10` 探测 `123/udp` **均无 NTP 应答**。
+
+因此一旦断外网：
+- 两台都失去时间源，只能靠各自 RTC 自由运行，日漂移可达数百毫秒到数秒；
+- `timedatectl` 仍显示 `System clock synchronized: yes`，这是最后一次同步的历史状态，**不代表当前还有时间源**；
+- 时钟不一致会直接影响 etcd 选举超时、日志时序、TLS 证书校验（MySQL GTID 本身不依赖时钟，但业务写入顺序依赖）。
+
+`systemd-timesyncd` 只能做客户端、不能对外授时，所以无外网场景必须改用 **chrony**（或 ntpd）自建内部时间源。
+
+#### 推荐方案：固定主备授时（.27 为主，.28 为备）
+
+| 角色 | 节点 | 配置要点 |
+|---|---|---|
+| NTP 主 | 10.18.1.27 | 无上游，`local stratum 10` 用本机时钟授时，`allow 10.18.1.0/24` |
+| NTP 备 | 10.18.1.28 | `server 10.18.1.27 iburst`，`local stratum 12` 兜底，`allow 10.18.1.0/24` |
+
+为什么固定一台当主：内网没有可信时钟源时，任何方案都只能保证"两台相对一致"，不能保证绝对准确。固定 .27 为主可以避免两台互相比较时出现来回选举；.28 的 `local stratum 12` 保证 .27 宕机后仍能继续对客户端授时。
+
+> **NTP 主备与 MySQL/keepalived 主备无关**，不需要随 VIP 漂移。当前业务数据在 .28、切换后 MySQL 主库可能是 .28，但 NTP 主仍固定 .27，两者互不影响。
+
+#### 步骤 1：安装 chrony（务必在有外网时先做）
+
+chrony 与 `systemd-timesyncd` 冲突（都提供 `time-daemon`），安装时 apt 会自动移除 timesyncd：
+
+```bash
+sudo apt-get install -y chrony
+systemctl is-active chrony                 # active
+systemctl is-active systemd-timesyncd      # inactive（已移除）
+```
+
+已提前把安装包缓存到两台机器的 `/var/cache/apt/archives/`；完全离线时可用：
+
+```bash
+sudo dpkg -i /var/cache/apt/archives/chrony_4.2-2ubuntu2.1_amd64.deb
+sudo apt-get -f install -y                 # 补齐本地依赖（正常应无额外下载）
+```
+
+若内网本来就有授时服务器（域控、核心交换机等），先用它，不必自建：
+
+```bash
+sudo chronyd -Q 'server 10.18.1.254 iburst'   # 有应答并输出 offset 即说明是可用 NTP 源
+```
+
+#### 步骤 2：配置
+
+**10.18.1.27** `/etc/chrony/chrony.conf`（先备份原文件）：
+
+```
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+rtcsync
+makestep 1.0 3
+
+# 内网无外网：以本机时钟为基准授时
+local stratum 10
+allow 10.18.1.0/24
+
+# 恢复外网后可取消注释；公网源 stratum 更低，会自动优先
+# pool ntp.ubuntu.com iburst
+```
+
+**10.18.1.28** `/etc/chrony/chrony.conf`：
+
+```
+driftfile /var/lib/chrony/chrony.drift
+logdir /var/log/chrony
+rtcsync
+makestep 1.0 3
+
+# 同步 NTP 主
+server 10.18.1.27 iburst minpoll 4 maxpoll 6
+# .27 不可达时用本机时钟兜底授时（stratum 高于主，主恢复后自动切回）
+local stratum 12
+allow 10.18.1.0/24
+
+# pool ntp.ubuntu.com iburst
+```
+
+```bash
+sudo mkdir -p /var/log/chrony
+sudo systemctl restart chrony
+sudo systemctl enable chrony
+```
+
+> 配置里必须写 **IP**，不能写域名——无外网时 DNS 解析会失败。
+> 若 .28 上也要让其他主机通过 VIP `10.18.1.30` 授时，无需额外配置：chrony 监听 `0.0.0.0:123`，VIP 漂移过来后自然应答。
+
+#### 步骤 3：验证
+
+```bash
+# .27：应显示 Reference ID 为本地时钟、Stratum 10
+chronyc tracking
+
+# .28：应看到 ^* 10.18.1.27，Stratum 11
+chronyc sources -v
+chronyc tracking
+
+# 在 .27 上查看有哪些客户端在同步
+sudo chronyc clients
+
+# 两台时钟差（应 < 100ms）
+ssh 10.18.1.28 'date +%s.%N'; date +%s.%N
+```
+
+注意：装 chrony 后 `timedatectl` 的状态字段不再可靠（实测 .27 显示 `NTP service: active` 但 `System clock synchronized: no`，.28 显示 `yes`）——这些字段由 timedated 维护，并不反映 chrony 的同步状态，**属正常现象**。判断授时是否正常只看 `chronyc tracking` / `chronyc sources`（应为 `Leap status : Normal`，`.28` 的源带 `^*`）。
+
+#### 步骤 4：故障与时间跳变
+
+- **.27 宕机**：.28 约 3 个轮询周期（`minpoll 4` ≈ 16s）后判定源不可用，启用 `local stratum 12` 继续授时；期间依靠 RTC 保持精度。
+- **.27 恢复**：.28 重新同步 .27。因已过启动初期的 3 次校时窗口，chrony 只做 **slew**（最大约 300 秒/小时），不会瞬间跳变，避免影响 etcd/MySQL。
+- **两台同时断电重启**：各自 RTC 漂移可能不同，启动后 .27 先成为源，.28 随后 slew 对齐；开机后建议人工执行一次上面的验证命令。
+- **需要立即强制对齐**（例如偏差已达分钟级）：`sudo chronyc makestep`。这会瞬间跳变时间，**etcd 对时间跳变敏感**，应在停 keepalived/etcd 后再做。
+- 容器（MySQL/Redis/etcd）共享宿主机时钟，无需单独配置。
+
+#### 可选：恢复外网后切回公网授时
+
+取消两台配置里 `pool ntp.ubuntu.com iburst` 的注释并 `systemctl restart chrony` 即可。公网源 stratum 2 低于本地 10/12，chrony 会自动优先公网源；`.28` 也可能直接同步公网而不是 .27，这属于正常行为。断网后会自动退回本地授时，无需人工干预。
 
 ---
 
@@ -527,6 +627,8 @@ tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
 | 11 | 脚本日志 | `tail -50 /home/sder/ha/replica/logs/keepalived-wrapper.log` | 无 `command not found` / 无报错 |
 | 12 | 已无 TiDB 实例 | `grep -c VI_TIDB /etc/keepalived/keepalived.conf` | 0 |
 | 13 | 健康检查链路 | `sudo /etc/keepalived/replica-runner.sh check; echo $?` | 0 |
+| 14 | 授时链路（见 2.5） | .27 `chronyc tracking`；.28 `chronyc sources -v` | .27 Stratum 10、本地时基；.28 `^* 10.18.1.27` |
+| 15 | 两台时钟差 | `ssh 10.18.1.28 'date +%s.%N'; date +%s.%N` | 差 < 0.1s |
 
 ---
 
@@ -616,6 +718,7 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 12 | `restore_mysql_slave.sh` | IP/路径写死、无条件清空 `data/mysql` | 误用丢数据 | ✅ 源改 VIP；dump 为空即中止；持有 VIP 时拒绝执行；异步调用 |
 | 13 | 全局 | 路径与密码硬编码 | 迁移/改密成本高 | 🔶 统一收敛到 `scripts/base.sh`；仍需改密时只改一处 |
 | 14 | `config/redis.conf` | 挂载但被命令行参数覆盖 | 改文件无效 | ⬜ 删除挂载或改为单入口 |
+| 15 | 授时 | 两台均依赖公网 `ntp.ubuntu.com`，内网无 NTP 服务器 | 断外网后各自自由运行，时钟逐渐漂移 | ✅ 2026-11-06 已切换为 chrony 内部主备（见 2.5）：.27 `local stratum 10` 授时，.28 同步 .27（实测 offset 微秒级） |
 
 ---
 

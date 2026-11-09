@@ -8,6 +8,13 @@ MASTER_IP="10.18.1.30"  # 通过 VIP 连接当前主库
 
 echo "[REDIS NOTIFY] Becoming BACKUP. Configuring as SLAVE..." 2>&1 | _ts_pipe >> "$LOG"
 
+# keepalived 启动时先进入 BACKUP 再切 MASTER，两个过渡会重叠；
+# 若本机已经持有 VIP，说明已晋升为主，绝不能再执行降级。
+if is_on_vip; then
+    echo "[REDIS NOTIFY] 本机已持有 VIP（已晋升 MASTER），跳过降级" 2>&1 | _ts_pipe >> "$LOG"
+    exit 0
+fi
+
 # 获取当前 Redis 角色
 ROLE=$(docker exec -i redis redis-cli -a "A8K5h7+6!?" info replication 2>/dev/null | grep "role:" | cut -d: -f2 | tr -d '\r')
 

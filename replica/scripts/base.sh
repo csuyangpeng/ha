@@ -13,6 +13,9 @@ LOG_DIR="$REPLICA_DIR/logs"
 SCRIPT_DIR="$REPLICA_DIR/scripts"
 LOG="$LOG_DIR/keepalived-wrapper.log"
 
+# 日志目录可能在首次部署/清空数据后被删掉；notify/track 脚本以 root 运行，可直接创建
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
 # ---- 网络 ----
 IFACE="ens3"
 MYSQL_VIP="10.18.1.30"

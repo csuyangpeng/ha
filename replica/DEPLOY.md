@@ -336,6 +336,38 @@ etcd1=http://10.18.1.27:2380,etcd2=http://10.18.1.28:2380,etcdvip=http://10.18.1
 
 `replica/init.sh` 会去改 `mysql/config/my.cnf` 和 `mysqlrouter/config/mysqlrouter.conf`（replica 目录下不存在这两个路径），加上 `set -e`，会直接中断。它属于 cluster 版本的脚本，节点差异请直接改 `docker-compose.yaml`。
 
+### 3.5 一键部署（推荐，从控制机执行）
+
+`scripts/deploy_cluster.sh` 在控制机（如 10.18.1.33）上运行，通过免密 SSH 完成第 3～9 节的全部动作：
+
+```bash
+cd /home/sder/ha/replica
+./scripts/deploy_cluster.sh \
+  --node1 10.18.1.27 --node2 10.18.1.28 --vip 10.18.1.30 \
+  --fresh --yes
+```
+
+执行内容：同步仓库（不改节点数据）→ 逐台渲染 `docker-compose.yaml` / `base.sh` / keepalived → etcd 首次 bootstrap（`ETCD_CLUSTER_STATE=new` 仅通过命令环境传入，`.env` 始终保留 `existing`）→ 主库 MySQL/Redis → 主库 keepalived、VIP、etcdvip → 备库 MySQL 复制 → 备库 Redis → 备库 keepalived → 全量验收。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--node1/--node2/--vip/--iface` | 覆盖默认的 .27/.28/.30/ens3 |
+| `--master 10.18.1.28` | 指定初始主库（默认 node1） |
+| `--fresh` | 允许清空两台的 `data/mysql`、`data/redis`、`data/etcd1`、`data/etcd2` |
+| `--yes` | 非交互确认（配合 `--fresh`） |
+| `--dry-run` | 只做只读预检并打印动作，不修改任何东西 |
+
+安全边界：
+
+- 只要任意一台检测到**非空数据目录、同名容器、运行中的 keepalived 或已存在的 VIP**，脚本会拒绝执行；必须显式 `--fresh` 才会清空。
+- 非 `--fresh` 模式可安全重复执行：已有数据不会被删除。
+- 首次 MySQL 初始化约 5 分钟（InnoDB + 时区数据），脚本让两台并行初始化，整体约 6～8 分钟。
+- 失败时自动收集两台节点的容器日志、keepalived journal、wrapper log 到 `/tmp/replica-deploy-<时间戳>/`；退出码 0 成功 / 2 参数 / 3 预检拒绝 / 4 等待超时 / 5 校验失败。
+
+手工分步执行仍然有效，对应关系：第 3 节 → 脚本 P3，第 4 节 → P5，第 5 节 → P6，第 6 节 → P7，第 7 节 → P8，第 8 节 → P10，第 9 节 → P11。
+
 ---
 
 ## 4. 启动 etcd 集群
@@ -502,22 +534,18 @@ docker exec -i redis redis-cli -a 'A8K5h7+6!?' info replication | \
 
 **不要** `chown root` 仓库里的脚本。`enable_script_security` 会校验脚本路径上每一级目录的属主，`/home/sder` 属于普通用户，脚本放在下面即使 `root:root + 755` 也仍会被判定为 insecure（实测 `keepalived -t` 退出码 5：`Disabling track script chk_mysql_ha due to insecure`）。
 
-正确做法是放一个 root 拥有的转发脚本在 `/etc/keepalived` 下：
+正确做法是放一个 root 拥有的转发脚本在 `/etc/keepalived` 下。仓库里已提供源文件 `scripts/replica-runner.sh`，两台都执行：
 
 ```bash
-sudo tee /etc/keepalived/replica-runner.sh >/dev/null <<'EOF'
-#!/bin/bash
-BASE=/home/sder/ha/replica/scripts
-case "${1:-}" in
-    check)  exec "$BASE/check_mysql_status.sh" ;;
-    master) exec "$BASE/notify_master.sh" ;;
-    backup) exec "$BASE/notify_slave.sh" ;;
-    *) echo "usage: $0 {check|master|backup}" >&2; exit 2 ;;
-esac
-EOF
-sudo chown root:root /etc/keepalived/replica-runner.sh
-sudo chmod 755 /etc/keepalived/replica-runner.sh
+sudo install -o root -g root -m 755 \
+    /home/sder/ha/replica/scripts/replica-runner.sh \
+    /etc/keepalived/replica-runner.sh
+
+# 校验：属主必须是 root，权限 755
+ls -l /etc/keepalived/replica-runner.sh
 ```
+
+> `replica-runner.sh` 只负责按参数转发：`check` → `check_mysql_status.sh`，`master` → `notify_master.sh`，`backup` → `notify_slave.sh`。以后修改任一脚本都不需要重装 runner，只有 runner 自身变更时才需要重新执行上面的 `install`。
 
 `global_defs` 里的 `script_user root` 保证以 root 身份执行（脚本里有 `docker exec`、写 `/var/run`、`ip addr`，不能用 sder 跑）。
 
@@ -711,7 +739,7 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 5 | `keepalived.conf` | 只有一份、priority 相同、vrid 51 | 与 TiDB 冲突、选举不确定 | ✅ vrid 251；.27=150 / .28=100 两份配置 |
 | 6 | `keepalived.conf` | 缺 `notify_fault` / `notify_stop` | 异常时组件不降级 | ✅ 均指向 `runner backup` |
 | 7 | `mysql_notify_slave.sh` | 降级时 `RESET MASTER` | 清空 binlog，破坏 GTID 追溯 | ✅ 删除；改为 `RESET SLAVE ALL` + `CHANGE MASTER` |
-| 8 | `docker-compose.yaml:112` | `ETCD_LEARNER` 非合法服务端参数，且 etcdvip 已在 `initial-cluster` | 可能启动失败 | ⬜ 首次启动时验证，报错则删除该变量 |
+| 8 | `docker-compose.yaml:112` | `ETCD_LEARNER` 非合法服务端参数，且 etcdvip 已在 `initial-cluster` | 可能启动失败 | ✅ `deploy_cluster.sh` 渲染时删除该行；手工部署按 4.1 删除 |
 | 9 | `docker-compose.yaml:116-118` | etcdvip 没有数据卷 | `down` 后成员数据丢失 | 🔶 脚本改用 `compose stop`，数据保留；长期建议换 etcd-proxy |
 | 10 | `check_mysql_status.sh` | 调 `mail` 但两台都没装 | 告警静默失败 | 🔶 已加 `command -v mail` 判断并限频写日志；建议装 mailutils 或改 webhook |
 | 11 | `init.sh` | 编辑不存在的文件 + `set -e` | 直接失败 | ⬜ 不使用（见 3.4） |
@@ -719,6 +747,9 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 13 | 全局 | 路径与密码硬编码 | 迁移/改密成本高 | 🔶 统一收敛到 `scripts/base.sh`；仍需改密时只改一处 |
 | 14 | `config/redis.conf` | 挂载但被命令行参数覆盖 | 改文件无效 | ⬜ 删除挂载或改为单入口 |
 | 15 | 授时 | 两台均依赖公网 `ntp.ubuntu.com`，内网无 NTP 服务器 | 断外网后各自自由运行，时钟逐渐漂移 | ✅ 2026-11-06 已切换为 chrony 内部主备（见 2.5）：.27 `local stratum 10` 授时，.28 同步 .27（实测 offset 微秒级） |
+| 16 | `notify_slave.sh` 各子脚本 | keepalived 启动时先执行 BACKUP 过渡、再执行 MASTER 过渡，两者并行；降级的 Redis/etcd 子脚本可能在新主晋升**之后**才执行 | 新主 Redis 被 `SLAVEOF VIP` 降为从库、etcdvip 被停掉，主备不可用 | ✅ 2026-11-09：`mysql/redis/etcd_notify_slave.sh` 增加 `is_on_vip` 短路（已持 VIP 则跳过降级），MySQL 等待循环提前退出；`deploy_cluster.sh` 在过渡收尾后再强制一次主角色 |
+| 17 | MySQL 首次初始化 | 本机磁盘上 InnoDB + 时区数据初始化约 5 分钟 | 部署等待超时 | ✅ 2026-11-09：`deploy_cluster.sh` 等待 600s，并让两台 MySQL 并行初始化 |
+| 18 | `restore_mysql_slave.sh` | 用 `mysqladmin ping` 判断就绪，初始化阶段的临时实例会误报 | 导入过早失败 | ✅ 2026-11-09：改为 TCP + 密码 `SELECT 1`，最多等 300s |
 
 ---
 

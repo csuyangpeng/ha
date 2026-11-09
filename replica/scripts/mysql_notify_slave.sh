@@ -42,6 +42,11 @@ mysql_exec -e "START SLAVE;" 2>&1 | _ts_pipe >> "$LOG"
 IO_RUNNING=""
 SQL_RUNNING=""
 for _ in $(seq 1 30); do
+    # 启动期 BACKUP 过渡与随后的 MASTER 过渡重叠：一旦拿到 VIP 就立刻停止降级流程
+    if is_on_vip; then
+        echo "[NOTIFY] 等待期间已持有 VIP，说明已晋升 MASTER，终止降级" 2>&1 | _ts_pipe >> "$LOG"
+        exit 0
+    fi
     STATUS=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)
     IO_RUNNING=$(echo "$STATUS" | awk -F': ' '/Slave_IO_Running:/{print $2}')
     SQL_RUNNING=$(echo "$STATUS" | awk -F': ' '/Slave_SQL_Running:/{print $2}')

@@ -43,9 +43,14 @@ log "4. 重新创建 MySQL 容器"
 ( cd "$REPLICA_DIR" && docker compose up -d mysql ) >> "$LOG" 2>&1
 
 log "5. 等待 MySQL 就绪"
+# 首次初始化时临时实例 --skip-networking，必须用 TCP + 密码确认正式实例已就绪
 READY=0
-for _ in $(seq 1 60); do
-    if mysql_alive; then READY=1; break; fi
+for _ in $(seq 1 100); do
+    if docker exec -e MYSQL_PWD="$MYSQL_PASS" mysql mysql -h 127.0.0.1 -u"$MYSQL_USER" \
+        -N -B -e 'SELECT 1' >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
     sleep 3
 done
 if [ "$READY" -ne 1 ]; then

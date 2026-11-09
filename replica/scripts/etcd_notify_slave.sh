@@ -7,6 +7,12 @@ echo "[ETCD-SLAVE] 成为备份节点" 2>&1 | _ts_pipe >> "$LOG"
 echo "本机IP: $LOCAL_IP" 2>&1 | _ts_pipe >> "$LOG"
 echo "================================================" 2>&1 | _ts_pipe >> "$LOG"
 
+# 与 redis_notify_slave 同理：启动期 BACKUP/MASTER 过渡重叠，已持有 VIP 时不得停 etcdvip
+if is_on_vip; then
+    echo "[ETCD-SLAVE] 本机已持有 VIP（已晋升 MASTER），跳过降级" 2>&1 | _ts_pipe >> "$LOG"
+    exit 0
+fi
+
 wait_etcd_health() {
     local endpoint=$1 tries=${2:-30} i
     for i in $(seq 1 "$tries"); do

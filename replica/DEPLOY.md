@@ -368,6 +368,33 @@ cd /home/sder/ha/replica
 
 手工分步执行仍然有效，对应关系：第 3 节 → 脚本 P3，第 4 节 → P5，第 5 节 → P6，第 6 节 → P7，第 7 节 → P8，第 8 节 → P10，第 9 节 → P11。
 
+### 3.6 卸载/清理（从控制机执行）
+
+`scripts/cleanup_cluster.sh` 清空两台节点上的集群状态，回到可以按本文档手工重新安装的干净状态：
+
+```bash
+cd /home/sder/ha/replica
+./scripts/cleanup_cluster.sh \
+  --node1 10.18.1.27 --node2 10.18.1.28 --yes
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--node1/--node2/--vip/--iface` | 覆盖默认的 .27/.28/.30/ens3 |
+| `--yes` | 非交互确认；不加则要求输入 `DELETE` |
+| `--dry-run` | 只检查 ssh/sudo/docker 连通性并打印动作，不修改任何东西 |
+
+清理内容：
+
+- **keepalived**：停止服务，删除 `/etc/keepalived/replica-runner.sh`；`keepalived.conf` 从 `keepalived.conf.bak.*` 里恢复**部署前**的版本（跳过仍引用 `replica-runner` 的备份），没有可用备份则删除配置并 `disable keepalived`
+- **容器**：`docker compose down --remove-orphans` + 强制删除 `mysql` / `redis` / `etcd` / `etcdvip`
+- **数据**：`data/mysql`、`data/redis`、`data/etcd1`、`data/etcd2`
+- **日志与运行态**：`logs/*.log`、`/var/run/replica_*`、`/tmp/master_dump*.sql`、`/tmp/keepalived.conf.new`
+
+保留：仓库文件、docker 镜像、keepalived 软件包、ssh `known_hosts`、`keepalived.conf.bak.*`。清理完成后会逐台校验（无同名容器、无数据、无 VIP、keepalived 未运行、runner 已删除、端口空闲），有残留则退出码 5。退出码：0 成功 / 2 参数 / 3 取消或 ssh 预检失败 / 5 清理后校验失败 / 6 远程命令失败。
+
+> 清理只针对 replica 集群。如果清理前 keepalived 上还跑着别的配置（例如 TiDB），脚本会尽量恢复部署前的 `keepalived.conf` 并用 `keepalived -t` 校验，但仍建议清理后用 `ip addr` 和 `systemctl status keepalived` 复核一次。
+
 ---
 
 ## 4. 启动 etcd 集群

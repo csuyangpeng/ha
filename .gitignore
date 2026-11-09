@@ -1,2 +1,3 @@
 replica/scripts/mysql_ha_test/logs/
 *.log
+replica/.restoring

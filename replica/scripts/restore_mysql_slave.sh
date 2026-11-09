@@ -5,9 +5,20 @@ set -euo pipefail
 
 source "/home/sder/ha/replica/scripts/base.sh"
 
+# 重建期间通知健康检查不要强制只读：导入需要用 root 写库。
+# （备库正常状态下是 super_read_only=ON，root 也写不进去）
+RESTORE_FLAG="${REPLICA_DIR}/.restoring"
+echo $$ > "$RESTORE_FLAG"
+trap 'rm -f "$RESTORE_FLAG"' EXIT
+
 MASTER_IP="$MYSQL_VIP"
 BACKUP_FILE="/tmp/master_dump.sql"
 LOCAL_FILE="/tmp/master_dump_local.sql"
+
+# VIP 会在两台节点间漂移，SSH 主机密钥也随之变化；这里不校验 known_hosts，
+# 否则每次切换后自动重建都会因 "Host key verification failed" 失败。
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o BatchMode=yes -o ConnectTimeout=5)
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
@@ -20,13 +31,13 @@ log "=== 开始重建本机 MySQL 从库（源: ${MASTER_IP}）==="
 
 # 1. 在主库上导出（通过 ssh 进入对端容器，避免依赖本机 mysql 客户端）
 log "1. 在主库 ${MASTER_IP} 导出全量备份"
-ssh "sder@${MASTER_IP}" "docker exec mysql mysqldump -uroot -p'${MYSQL_PASS}' \
+ssh "${SSH_OPTS[@]}" "sder@${MASTER_IP}" "docker exec mysql mysqldump -uroot -p'${MYSQL_PASS}' \
   --all-databases --single-transaction --master-data=2 --set-gtid-purged=ON \
   --routines --events > ${BACKUP_FILE}" >> "$LOG" 2>&1
 
 # 2. 拉回本地并校验
 log "2. 复制备份文件到本机"
-scp -q "sder@${MASTER_IP}:${BACKUP_FILE}" "$LOCAL_FILE" >> "$LOG" 2>&1
+scp -q "${SSH_OPTS[@]}" "sder@${MASTER_IP}:${BACKUP_FILE}" "$LOCAL_FILE" >> "$LOG" 2>&1
 if [ ! -s "$LOCAL_FILE" ]; then
     log "[RESTORE] 备份文件为空，终止（未修改本地数据）"
     exit 1
@@ -91,7 +102,7 @@ done
 echo "$STATUS" >> "$LOG"
 
 rm -f "$BACKUP_FILE" 2>/dev/null || true
-ssh "sder@${MASTER_IP}" "rm -f ${BACKUP_FILE}" >> "$LOG" 2>&1 || true
+ssh "${SSH_OPTS[@]}" "sder@${MASTER_IP}" "rm -f ${BACKUP_FILE}" >> "$LOG" 2>&1 || true
 
 if [ "$IO_RUNNING" = "Yes" ] && [ "$SQL_RUNNING" = "Yes" ]; then
     log "=== 重建完成：复制正常 ==="

@@ -105,6 +105,23 @@ main() {
         exit 0
     fi
 
+    # ---- BACKUP：确保只读（SET GLOBAL 不持久，重启后会变回可写） ----
+    # 应用当前用 root 连接，read_only=ON 挡不住 SUPER，必须 super_read_only=ON。
+    # 从库重建（restore_mysql_slave.sh）需要用 root 导入，期间靠标记文件跳过。
+    local restoring=0 ro sro flag_age
+    if [ -f "${REPLICA_DIR}/.restoring" ]; then
+        flag_age=$(( $(date +%s) - $(stat -c %Y "${REPLICA_DIR}/.restoring" 2>/dev/null || echo 0) ))
+        [ "$flag_age" -lt 3600 ] && restoring=1
+    fi
+    if [ "$restoring" -eq 0 ]; then
+        ro=$(mysql_query "SELECT @@global.read_only")
+        sro=$(mysql_query "SELECT @@global.super_read_only")
+        if [ "$ro" != "1" ] || [ "$sro" != "1" ]; then
+            mysql_exec -e "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" >/dev/null 2>&1
+            log "BACKUP 只读状态异常（read_only=${ro:-?}, super_read_only=${sro:-?}），已修正"
+        fi
+    fi
+
     # ---- BACKUP：只看复制健康，不返回失败 ----
     local status io sql_r lag
     status=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)

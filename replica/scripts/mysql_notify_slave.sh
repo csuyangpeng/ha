@@ -8,6 +8,13 @@ source "/home/sder/ha/replica/scripts/base.sh"
 
 MASTER_HOST="$MYSQL_VIP"
 
+# 标记降级进行中：RESET SLAVE ALL 到 START SLAVE 建链之间 SHOW SLAVE STATUS
+# 会短暂为空或 IO/SQL=No，健康检查会把这段正常过渡误判为复制损坏并触发
+# 全量从库重建（约 3~4 分钟）。标记不主动删除：keepalived 停止时可能杀掉
+# 本脚本再以 BACKUP 重新拉起，若此处删除会把仍在进行中的降级暴露给健康
+# 检查；统一由 check_mysql_status.sh 按 120s 新鲜度窗口失效。
+echo "$(date +%s)" > "$DEMOTE_FLAG" 2>/dev/null || true
+
 echo "[NOTIFY] Becoming BACKUP. Demoting MySQL to SLAVE of ${MASTER_HOST}..." 2>&1 | _ts_pipe >> "$LOG"
 
 if ! mysql_alive; then

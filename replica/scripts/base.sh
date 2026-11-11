@@ -38,6 +38,7 @@ LOCK_FILE="/var/run/replica_health_check.lock"
 RESTORE_TS_FILE="/var/run/replica_restore_last"
 RESTORE_INTERVAL=600    # 从库重建最小间隔（秒）
 PROMOTE_FLAG="/var/run/replica_promoting"   # 提升进行中标记，避免健康检查误判
+DEMOTE_FLAG="/var/run/replica_demoting"     # 降级进行中标记，避免健康检查误触发从库重建
 
 # ---- 常用封装 ----
 mysql_exec() {   # mysql_exec -e "SQL"  /  mysql_exec < file.sql；stderr 保留给调用方处理

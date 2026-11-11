@@ -55,6 +55,15 @@ in_promotion() {
     [ "$age" -ge 0 ] && [ "$age" -lt 120 ]
 }
 
+# 降级进行中（notify_slave 正在重建复制关系，复制短暂为空/异常属正常过渡）
+in_demotion() {
+    [ -f "$DEMOTE_FLAG" ] || return 1
+    local started age
+    started=$(cat "$DEMOTE_FLAG" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - started ))
+    [ "$age" -ge 0 ] && [ "$age" -lt 120 ]
+}
+
 # 从库重建：异步执行 + 限频，避免拖住 keepalived 的健康检查
 schedule_restore() {
     local now last
@@ -126,6 +135,10 @@ main() {
     local status io sql_r lag
     status=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)
     if [ -z "$status" ]; then
+        if in_demotion; then
+            log_limited demoting 30 "BACKUP 降级进行中（尚未配置复制），跳过重建"
+            exit 0
+        fi
         notify_limited no_slave 300 "$role" "WARNING" "BACKUP 未配置复制关系（${LOCAL_IP}），准备重建"
         schedule_restore
         exit 0
@@ -136,6 +149,10 @@ main() {
     lag=$(echo "$status" | awk -F': ' '/Seconds_Behind_Master:/{print $2}')
 
     if [ "$io" != "Yes" ] || [ "$sql_r" != "Yes" ]; then
+        if in_demotion; then
+            log_limited demoting 30 "BACKUP 降级进行中（IO=${io:-N/A}, SQL=${sql_r:-N/A}），跳过重建"
+            exit 0
+        fi
         notify_limited repl_broken 300 "$role" "WARNING" "BACKUP 复制异常（IO=${io:-N/A}, SQL=${sql_r:-N/A}），准备重建"
         schedule_restore
         exit 0

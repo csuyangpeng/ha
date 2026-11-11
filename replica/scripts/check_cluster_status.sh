@@ -10,6 +10,7 @@
 # 用法：
 #   ./check_cluster_status.sh
 #   ./check_cluster_status.sh --node1 10.18.1.27 --node2 10.18.1.28 --vip 10.18.1.30
+#   ./check_cluster_status.sh --vip-list "10.18.1.30,10.18.1.31/24"
 #   ./check_cluster_status.sh -q          # 只输出异常项和汇总
 #
 # 也可以放到 cron / 监控里：退出码非 0 即需要人看。
@@ -26,7 +27,9 @@ fi
 
 NODE1=${NODE1:-10.18.1.27}
 NODE2=${NODE2:-10.18.1.28}
-MYSQL_VIP=${MYSQL_VIP:-10.18.1.30}
+# base.sh 已定义 VIPS/MYSQL_VIP；单独拷走本脚本时用下面的默认值
+VIPS=("${VIPS[@]:-10.18.1.30}")
+MYSQL_VIP=${MYSQL_VIP:-${VIPS[0]%%/*}}
 MYSQL_USER=${MYSQL_USER:-root}
 MYSQL_PASS=${MYSQL_PASS:-'s<9!Own1z4'}
 REDIS_PASS=${REDIS_PASS:-'A8K5h7+6!?'}
@@ -40,6 +43,9 @@ while [ $# -gt 0 ]; do
         --node1)  NODE1=$2; shift 2 ;;
         --node2)  NODE2=$2; shift 2 ;;
         --vip)    MYSQL_VIP=$2; shift 2 ;;
+        --vip-list)
+                  IFS=',' read -r -a VIPS <<<"$2"; shift 2
+                  MYSQL_VIP=${VIPS[0]%%/*} ;;
         --user)   SSH_USER=$2; shift 2 ;;
         --timeout) SSH_TMO=$2; shift 2 ;;
         -q|--quiet) QUIET=1; shift ;;
@@ -47,6 +53,8 @@ while [ $# -gt 0 ]; do
         *) echo "未知参数: $1（-h 查看用法）" >&2; exit 2 ;;
     esac
 done
+
+VIPS_LIST=$(printf '%s,' "${VIPS[@]}"); VIPS_LIST=${VIPS_LIST%,}
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no)
 
@@ -71,6 +79,21 @@ ssh_run() {  # ssh_run <ip> <cmd...>
     local ip=$1; shift
     timeout "$SSH_TMO" ssh "${SSH_OPTS[@]}" "$SSH_USER@$ip" "$@" 2>/dev/null
 }
+
+vip_regex() {
+    local v out=""
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        out+="${out:+|}${v//./\\.}"
+    done
+    echo "$out"
+}
+
+held_vips() {  # 节点当前持有的、属于配置列表的 VIP
+    ssh_run "$1" "ip -o -4 addr show dev $IFACE | grep -oE 'inet ($(vip_regex))/' | awk '{print \$2}' | cut -d/ -f1 | paste -sd, -"
+}
+
+kv_get() { awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'; }
 
 remote_mysql() {  # remote_mysql <ip> <sql>  -> 制表符分隔、无表头
     local ip=$1 sql=$2
@@ -109,13 +132,51 @@ check_node() {
     st=$(ssh_run "$ip" 'systemctl is-active keepalived')
     [ "$st" = "active" ] && ok "keepalived active" || fail "keepalived 状态：${st:-未知}"
 
-    if [ "$(ssh_run "$ip" "ip -4 addr show dev $IFACE | grep -c 'inet $MYSQL_VIP/'")" -ge 1 ] 2>/dev/null; then
-        info "持有 VIP $MYSQL_VIP"
+    local held total
+    total=${#VIPS[@]}
+    held=$(held_vips "$ip")
+    IFS=',' read -r -a held_arr <<<"$held"
+    [ -n "$held" ] || held_arr=()
+
+    if [ "${#held_arr[@]}" -eq "$total" ]; then
+        info "持有全部 VIP（${held}）"
         NODE_HOLDER=1
+    elif [ "${#held_arr[@]}" -gt 0 ]; then
+        fail "仅持有 ${#held_arr[@]}/${total} 个 VIP（${held}），整组应同漂"
     else
-        info "未持有 VIP $MYSQL_VIP"
+        info "未持有 VIP"
     fi
     return 0
+}
+
+# 核心网 NF 健康（coremgr 写入的 verdict 文件）
+check_core_health() {
+    local ip=$1 out updated stale now age ready state cd names
+    out=$(ssh_run "$ip" "cat /var/run/coremgr_nf_health 2>/dev/null")
+    if [ -z "$out" ]; then
+        warn "核心网健康文件不存在（coremgr 未运行、未启用 nf_health 或为旧版本）"
+        return
+    fi
+    updated=$(printf '%s\n' "$out" | kv_get updated)
+    stale=$(printf '%s\n' "$out" | kv_get stale_after)
+    ready=$(printf '%s\n' "$out" | kv_get ready)
+    state=$(printf '%s\n' "$out" | kv_get state)
+    cd=$(printf '%s\n' "$out" | kv_get critical_down)
+    names=$(printf '%s\n' "$out" | kv_get critical_down_names)
+    now=$(date +%s)
+    age=$(( now - ${updated:-0} ))
+
+    if [ "${updated:-0}" -le 0 ] || [ "$age" -gt $(( ${stale:-20} + 5 )) ]; then
+        warn "核心网健康数据已过期（${age}s 未更新）"
+        return
+    fi
+    if [ "$ready" = "1" ]; then
+        ok "核心网就绪（state=${state}）"
+    elif [ "${cd:-0}" -gt 0 ]; then
+        fail "核心网关键网元异常：${names:-${state}}"
+    else
+        warn "核心网未就绪（state=${state}，尚未确认故障）"
+    fi
 }
 
 # ---------------------------------------------------------------- 容器
@@ -327,7 +388,7 @@ check_vip_services() {
 }
 
 # ---------------------------------------------------------------- main
-printf '%s\n' "replica 集群巡检  $(date '+%F %T %Z')  节点: $NODE1 / $NODE2  VIP: $MYSQL_VIP"
+printf '%s\n' "replica 集群巡检  $(date '+%F %T %Z')  节点: $NODE1 / $NODE2  VIP: $VIPS_LIST（数据面 $MYSQL_VIP）"
 printf '%s\n' "从 $(hostname)（$(hostname -I | awk '{print $1}')）探测"
 
 # 先确认可达，并找出 VIP 持有者
@@ -344,11 +405,20 @@ done
 
 section "VIP 归属"
 if [ -z "$HOLDER" ]; then
-    fail "没有任何节点持有 VIP $MYSQL_VIP"
-elif [ "$(for ip in "${reachable[@]}"; do ssh_run "$ip" "ip -4 addr show dev $IFACE | grep -c 'inet $MYSQL_VIP/'"; done | awk '{s+=$1} END{print s+0}')" -gt 1 ]; then
-    fail "多个节点同时持有 VIP（脑裂）"
+    fail "没有任何节点持有数据面 VIP $MYSQL_VIP"
 else
-    ok "VIP $MYSQL_VIP 由 $HOLDER 持有（唯一）"
+    local_split=0
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        n=0
+        for ip in "${reachable[@]}"; do
+            ssh_run "$ip" "ip -4 addr show dev $IFACE | grep -q 'inet $v/'" && n=$((n + 1))
+        done
+        [ "$n" -le 1 ] || { fail "VIP $v 同时被 $n 个节点持有（脑裂）"; local_split=1; }
+    done
+    if [ "$local_split" -eq 0 ]; then
+        ok "VIP 整组由 $HOLDER 唯一持有（$VIPS_LIST）"
+    fi
 fi
 
 for ip in "${reachable[@]}"; do
@@ -362,6 +432,7 @@ for ip in "${reachable[@]}"; do
         check_etcd "$ip"
     fi
     check_time "$ip"
+    check_core_health "$ip"
     check_ha_log "$ip"
 done
 

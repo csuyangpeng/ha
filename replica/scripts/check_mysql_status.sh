@@ -78,6 +78,9 @@ schedule_restore() {
     setsid "$SCRIPT_DIR/restore_mysql_slave.sh" >> "$LOG" 2>&1 < /dev/null &
 }
 
+# 依赖上面定义的日志/告警/提升判定函数，放在 main 之前 source
+source "/home/sder/ha/replica/scripts/check_core_status.sh"
+
 main() {
     # 防止重叠执行；进程退出自动释放，不会像普通锁文件那样残留
     exec 9>"$LOCK_FILE" || exit 0
@@ -86,12 +89,17 @@ main() {
     local role=MASTER
     is_on_vip || role=BACKUP
 
+    [ "$role" = "BACKUP" ] && core_gate_backup
+
     # ---- MySQL 进程不可用 ----
     if ! mysql_alive; then
         log "MySQL 不可用（role=${role}）"
         if [ "$role" = "MASTER" ]; then
-            send_notification "$role" "ERROR" "MySQL 不可用，释放 VIP 触发切换（${LOCAL_IP}）"
-            exit 1
+            if core_peer_ready_for_failover; then
+                send_notification "$role" "ERROR" "MySQL 不可用，释放 VIP 触发切换（${LOCAL_IP}）"
+                exit 1
+            fi
+            exit 0
         fi
         exit 0
     fi
@@ -111,6 +119,9 @@ main() {
         fi
 
         log_limited master_ok 300 "MASTER 检查通过（可写）"
+
+        # 核心网关键网元异常且对端就绪时才释放 VIP
+        core_gate_master || exit 1
         exit 0
     fi
 

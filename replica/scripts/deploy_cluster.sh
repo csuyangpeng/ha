@@ -16,8 +16,15 @@ set -Eeuo pipefail
 # ---------------- 默认值 ----------------
 NODE1="10.18.1.27"
 NODE2="10.18.1.28"
-VIP="10.18.1.30"
+VIPS_STR="10.18.1.30"
+VIP="10.18.1.30"          # 数据面 VIP，由 VIPS[0] 派生
+VIPS=("10.18.1.30/24")
+VIP_CSV="10.18.1.30/24"
 IFACE="ens3"
+COREMGR_PORT=8888
+NF_HEALTH_FILE="/var/run/coremgr_nf_health"
+CORE_GATE=1                # MASTER 核心网健康是否参与释放 VIP
+CORE_PEER_GATE_MYSQL=1     # MySQL 故障时是否要求对端核心网就绪
 MASTER_ARG=""
 FRESH=0
 ASSUME_YES=0
@@ -62,8 +69,12 @@ usage() {
 
   --node1 IP     节点 1（默认 $NODE1）
   --node2 IP     节点 2（默认 $NODE2）
-  --vip IP       虚拟 IP（默认 $VIP）
+  --vip IP       单个虚拟 IP（兼容旧用法，等价于 --vip-list 只有一个）
+  --vip-list L   虚拟 IP 列表，逗号分隔，如 "10.18.1.30,10.18.1.31/24"
+                 第 1 个是数据面 VIP（MySQL/Redis/etcdvip），整组同漂（默认 10.18.1.30）
   --iface NAME   网卡（默认 $IFACE）
+  --coremgr-port N   coremgr HTTP 端口，用于查询对端核心网健康（默认 8888）
+  --nf-health-file P coremgr 写入的核心网健康裁决文件（默认 $NF_HEALTH_FILE）
   --master IP    初始主库节点，必须是 node1 或 node2（默认 node1）
   --fresh        允许清空已有数据/容器（默认检测到就拒绝）
   --yes          非交互确认（配合 --fresh）
@@ -72,13 +83,52 @@ usage() {
 EOF
 }
 
+# 解析 --vip-list：校验 IPv4、补全 /24、按 IP 去重，并保证 VIP 不与节点 IP 冲突
+normalize_vips() {
+    local item ip prefix seen=" "
+    local -a raw=() parsed=() uniq=()
+    IFS=',' read -r -a raw <<<"$VIPS_STR"
+    for item in "${raw[@]}"; do
+        item=${item//[[:space:]]/}
+        [ -n "$item" ] || continue
+        ip=${item%%/*}
+        prefix=""
+        [[ $item == */* ]] && prefix="/${item#*/}"
+        [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "非法 VIP: $item" 2
+        [ -n "$prefix" ] || prefix="/24"
+        parsed+=("${ip}${prefix}")
+    done
+    [ "${#parsed[@]}" -gt 0 ] || die "--vip-list 不能为空" 2
+
+    for item in "${parsed[@]}"; do
+        ip=${item%%/*}
+        case "$seen" in *" $ip "*) continue ;; esac
+        seen+="$ip "
+        uniq+=("$item")
+    done
+    VIPS=("${uniq[@]}")
+    VIP="${VIPS[0]%%/*}"
+    printf -v VIP_CSV '%s,' "${VIPS[@]}"
+    VIP_CSV=${VIP_CSV%,}
+
+    for item in "${VIPS[@]}"; do
+        ip=${item%%/*}
+        if [ "$ip" = "$NODE1" ] || [ "$ip" = "$NODE2" ]; then
+            die "VIP $ip 与节点 IP 冲突" 2
+        fi
+    done
+}
+
 parse_args() {
     while (($#)); do
         case "$1" in
             --node1)   NODE1=${2:?}; shift 2 ;;
             --node2)   NODE2=${2:?}; shift 2 ;;
-            --vip)     VIP=${2:?}; shift 2 ;;
+            --vip)     VIPS_STR=${2:?}; shift 2 ;;
+            --vip-list) VIPS_STR=${2:?}; shift 2 ;;
             --iface)   IFACE=${2:?}; shift 2 ;;
+            --coremgr-port) COREMGR_PORT=${2:?}; shift 2 ;;
+            --nf-health-file) NF_HEALTH_FILE=${2:?}; shift 2 ;;
             --master)  MASTER_ARG=${2:?}; shift 2 ;;
             --fresh)   FRESH=1; shift ;;
             --yes)     ASSUME_YES=1; shift ;;
@@ -88,9 +138,10 @@ parse_args() {
         esac
     done
 
-    [[ $NODE1 =~ ^[0-9.]+$ && $NODE2 =~ ^[0-9.]+$ && $VIP =~ ^[0-9.]+$ ]] \
-        || die "--node1/--node2/--vip 必须是 IPv4 地址" 2
+    [[ $NODE1 =~ ^[0-9.]+$ && $NODE2 =~ ^[0-9.]+$ ]] \
+        || die "--node1/--node2 必须是 IPv4 地址" 2
     [ "$NODE1" != "$NODE2" ] || die "node1 与 node2 不能相同" 2
+    normalize_vips
 
     if [ -z "$MASTER_ARG" ]; then
         MASTER_ARG=$NODE1
@@ -190,14 +241,25 @@ EOS
     return 0
 }
 
+# 所有 VIP 的 IP 部分拼成正则：10\.18\.1\.30|10\.18\.1\.31
+vip_regex() {
+    local v out=""
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        out+="${out:+|}${v//./\\.}"
+    done
+    echo "$out"
+}
+
 # 返回 0 表示该节点已有状态（数据/容器/keepalived/VIP）
 node_has_state() {
-    local h=$1 out
+    local h=$1 out regex
+    regex=$(vip_regex)
     out=$(remote_q "$h" "
         sudo -n find $REPO/data -mindepth 2 -print -quit 2>/dev/null
         docker ps -a --format '{{.Names}}' | grep -xE 'mysql|redis|etcd|etcdvip' || true
         systemctl is-active keepalived 2>/dev/null | grep -qx active || true
-        ip -o -4 addr show dev $IFACE 2>/dev/null | grep 'inet $VIP/' || true
+        ip -o -4 addr show dev $IFACE 2>/dev/null | grep -E 'inet ($regex)/' || true
     ") || true
     [ -n "$out" ]
 }
@@ -210,12 +272,15 @@ node_port_conflicts() {
 }
 
 check_no_vip() {
-    local h
+    local h v
     for h in "$NODE1" "$NODE2"; do
-        if remote_q "$h" "ip -o -4 addr show dev $IFACE | grep -q 'inet $VIP/'"; then
-            warn "$h 已持有 VIP $VIP"
-            return 1
-        fi
+        for v in "${VIPS[@]}"; do
+            v=${v%%/*}
+            if remote_q "$h" "ip -o -4 addr show dev $IFACE | grep -q 'inet $v/'"; then
+                warn "$h 已持有 VIP $v"
+                return 1
+            fi
+        done
     done
     return 0
 }
@@ -286,9 +351,9 @@ sync_repo() {
 
 render_compose() {
     local h=$1 ip=$2 name=$3 sid=$4
-    run_script "$h" "$sid" "$name" "$ip" "$INITIAL_CLUSTER" <<'EOS'
+    run_script "$h" "$sid" "$name" "$ip" "$INITIAL_CLUSTER" "$VIP" <<'EOS'
 set -euo pipefail
-SID=$1; ETCD_NAME=$2; NODE_IP=$3; IC=$4
+SID=$1; ETCD_NAME=$2; NODE_IP=$3; IC=$4; DATA_VIP=$5
 cd /home/sder/ha/replica
 
 sed -E -i \
@@ -297,6 +362,8 @@ sed -E -i \
   -e "s#^([[:space:]]*- ETCD_ADVERTISE_CLIENT_URLS=http://)[0-9.]+:2379[[:space:]]*\$#\1${NODE_IP}:2379#" \
   -e "s#^([[:space:]]*- ETCD_INITIAL_ADVERTISE_PEER_URLS=http://)[0-9.]+:2380[[:space:]]*\$#\1${NODE_IP}:2380#" \
   -e "s#^([[:space:]]*- ETCD_INITIAL_CLUSTER=).*\$#\1${IC}#" \
+  -e "s#^([[:space:]]*- ETCD_ADVERTISE_CLIENT_URLS=http://)[0-9.]+:23790[[:space:]]*\$#\1${DATA_VIP}:23790#" \
+  -e "s#^([[:space:]]*- ETCD_INITIAL_ADVERTISE_PEER_URLS=http://)[0-9.]+:23800[[:space:]]*\$#\1${DATA_VIP}:23800#" \
   -e "s#^([[:space:]]*- \./data/)etcd[0-9]+(:/etcd-data)[[:space:]]*\$#\1${ETCD_NAME}\2#" \
   -e "/^[[:space:]]*- ETCD_LEARNER=/d" \
   docker-compose.yaml
@@ -312,6 +379,9 @@ grep -q "ETCD_NAME: ${ETCD_NAME}" /tmp/dc-rendered.yml
 grep -q "ETCD_ADVERTISE_CLIENT_URLS: http://${NODE_IP}:2379" /tmp/dc-rendered.yml
 grep -q "ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_IP}:2380" /tmp/dc-rendered.yml
 grep -q "ETCD_INITIAL_CLUSTER: ${IC}" /tmp/dc-rendered.yml
+grep -q "ETCD_ADVERTISE_CLIENT_URLS: http://${DATA_VIP}:23790" /tmp/dc-rendered.yml
+grep -q "ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${DATA_VIP}:23800" /tmp/dc-rendered.yml
+grep -q "etcdvip=http://${DATA_VIP}:23800" /tmp/dc-rendered.yml
 grep -q "source: /home/sder/ha/replica/data/${ETCD_NAME}" /tmp/dc-rendered.yml
 ! grep -q 'ETCD_LEARNER' /tmp/dc-rendered.yml
 EOS
@@ -319,46 +389,88 @@ EOS
 
 render_base() {
     local h=$1
-    run_script "$h" "$IFACE" "$VIP" "$NODE1" "$NODE2" <<'EOS'
+    run_script "$h" "$IFACE" "$NODE1" "$NODE2" "$COREMGR_PORT" "$NF_HEALTH_FILE" \
+        "$CORE_GATE" "$CORE_PEER_GATE_MYSQL" "${VIPS[@]}" <<'EOS'
 set -euo pipefail
-IFACE_=$1; VIP_=$2; N1=$3; N2=$4
+IFACE_=$1; N1=$2; N2=$3; PORT=$4; HEALTH=$5; GATE=$6; PGATE=$7
+shift 7
+DATA_VIP=${1%%/*}
+
+VIP_LINE=""
+for v in "$@"; do
+    [ -n "$VIP_LINE" ] && VIP_LINE+=" "
+    VIP_LINE+="\"$v\""
+done
+
 cd /home/sder/ha/replica
 sed -E -i \
   -e "s#^IFACE=.*#IFACE=\"${IFACE_}\"#" \
-  -e "s#^MYSQL_VIP=.*#MYSQL_VIP=\"${VIP_}\"#" \
+  -e "s#^VIPS=\(.*\)#VIPS=(${VIP_LINE})#" \
   -e "s#^NODE1=.*#NODE1=\"${N1}\"#" \
   -e "s#^NODE2=.*#NODE2=\"${N2}\"#" \
+  -e "s#^COREMGR_PORT=.*#COREMGR_PORT=${PORT}#" \
+  -e "s#^NF_HEALTH_FILE=.*#NF_HEALTH_FILE=\"${HEALTH}\"#" \
+  -e "s#^CORE_GATE=.*#CORE_GATE=${GATE}#" \
+  -e "s#^CORE_PEER_GATE_MYSQL=.*#CORE_PEER_GATE_MYSQL=${PGATE}#" \
   scripts/base.sh
-sed -E -i "s#^MASTER_IP=.*#MASTER_IP=\"${VIP_}\"#" scripts/redis_notify_slave.sh
+# 旧版本渲染留下的硬编码 MYSQL_VIP 删除；保留由 VIPS[0] 派生的那行
+sed -E -i '/^MYSQL_VIP="?[0-9]/d' scripts/base.sh
+sed -E -i "s#^MASTER_IP=.*#MASTER_IP=\"${DATA_VIP}\"#" scripts/redis_notify_slave.sh
+
+grep -Fqx "VIPS=(${VIP_LINE})" scripts/base.sh
+grep -Fqx 'MYSQL_VIP="${VIPS[0]%/*}"' scripts/base.sh
+! grep -qE '^MYSQL_VIP="?[0-9]' scripts/base.sh
+printf '%s\n' "$VIP_LINE"
 bash -n scripts/base.sh
 EOS
 }
 
 render_keepalived() {
     local h=$1 ip=$2 peer=$3 prio=$4
-    run_script "$h" "$ip" "$peer" "$prio" "$IFACE" "$VIP" <<'EOS'
+    run_script "$h" "$ip" "$peer" "$prio" "$IFACE" "$VIP_CSV" <<'EOS'
 set -euo pipefail
-NODE_IP=$1; PEER_IP=$2; PRIO=$3; IFACE_=$4; VIP_=$5
+NODE_IP=$1; PEER_IP=$2; PRIO=$3; IFACE_=$4; VIP_CSV=$5
 cd /home/sder/ha/replica
 src=scripts/keepalived.conf
 [ -f "$src" ] || { echo "缺少 $src"; exit 1; }
+IFS=',' read -r -a VIPS_ <<<"$VIP_CSV"
+
+# 标记区整段替换：VIP 多行不会被 sed 折叠或重复
+awk -v peer="$PEER_IP" -v iface="$IFACE_" -v csv="$VIP_CSV" '
+BEGIN { n = split(csv, arr, ",") }
+/@@PEER_BEGIN@@/ { print "        " peer; in_peer=1; next }
+/@@PEER_END@@/   { in_peer=0; next }
+/@@VIP_BEGIN@@/  { for (i=1; i<=n; i++) print "        " arr[i] " dev " iface; in_vip=1; next }
+/@@VIP_END@@/    { in_vip=0; next }
+in_peer || in_vip { next }
+{ print }
+' "$src" > /tmp/keepalived.conf.markers
+
 sed -E \
   -e "s#^([[:space:]]*interface[[:space:]]+).*#\1${IFACE_}#" \
   -e "s#^([[:space:]]*priority[[:space:]]+)[0-9]+#\1${PRIO}#" \
   -e "s#^([[:space:]]*unicast_src_ip[[:space:]]+).*#\1${NODE_IP}#" \
-  -e "s#^([[:space:]]+)10\.18\.1\.[0-9]+[[:space:]]*\$#\1${PEER_IP}#" \
-  -e "s#^([[:space:]]+)10\.18\.1\.[0-9]+/24 dev .*#\1${VIP_}/24 dev ${IFACE_}#" \
-  "$src" > /tmp/keepalived.conf.new
+  /tmp/keepalived.conf.markers > /tmp/keepalived.conf.new
+
 grep -q "priority $PRIO" /tmp/keepalived.conf.new
 grep -q "unicast_src_ip $NODE_IP" /tmp/keepalived.conf.new
 grep -q "virtual_router_id 251" /tmp/keepalived.conf.new
+! grep -q '@@' /tmp/keepalived.conf.new
+[ "$(grep -cE "^[[:space:]]*${PEER_IP}[[:space:]]*\$" /tmp/keepalived.conf.new)" -eq 1 ] \
+    || { echo "unicast_peer 中 $PEER_IP 行数不为 1"; exit 1; }
+for v in "${VIPS_[@]}"; do
+    [ "${v%%/*}" != "$NODE_IP" ] || { echo "VIP 与节点 IP 相同: $v"; exit 1; }
+    [ "$(grep -cE "^[[:space:]]*${v}[[:space:]]+dev[[:space:]]+${IFACE_}[[:space:]]*\$" /tmp/keepalived.conf.new)" -eq 1 ] \
+        || { echo "VIP $v 渲染行数不为 1"; exit 1; }
+done
 EOS
 }
 
 install_keepalived() {
     local h=$1
-    run_script "$h" <<'EOS'
+    run_script "$h" "${VIPS[@]}" <<'EOS'
 set -euo pipefail
+VIPS_=("$@")
 cd /home/sder/ha/replica
 sudo -n install -o root -g root -m 755 \
     scripts/replica-runner.sh /etc/keepalived/replica-runner.sh
@@ -366,7 +478,17 @@ sudo -n cp -a /etc/keepalived/keepalived.conf \
     "/etc/keepalived/keepalived.conf.bak.$(date +%Y%m%d%H%M%S)"
 sudo -n install -o root -g root -m 644 \
     /tmp/keepalived.conf.new /etc/keepalived/keepalived.conf
+
+# coremgr 的单一 VIP 事实源；一行一个 IP[/prefix]
+tmp=$(mktemp)
+printf '%s\n' "${VIPS_[@]}" > "$tmp"
+sudo -n install -o root -g root -m 644 "$tmp" /etc/keepalived/replica-vips
+rm -f "$tmp"
+[ "$(wc -l < /etc/keepalived/replica-vips)" -eq "${#VIPS_[@]}" ] \
+    || { echo "replica-vips 行数与 VIP 数量不一致"; exit 1; }
+
 [ "$(stat -c '%U:%G %a' /etc/keepalived/replica-runner.sh)" = "root:root 755" ]
+[ "$(stat -c '%U:%G %a' /etc/keepalived/replica-vips)" = "root:root 644" ]
 sudo -n keepalived -t -f /etc/keepalived/keepalived.conf
 sudo -n systemctl enable keepalived >/dev/null 2>&1 || true
 EOS
@@ -441,12 +563,32 @@ redis_slave_ok() {
     grep -q 'master_link_status:up' <<<"$out"
 }
 
+# 数据面 VIP（角色判定）
 vip_on() {
     remote_q "$1" "ip -o -4 addr show dev $IFACE | grep -q 'inet $VIP/'"
 }
 
 vip_absent() {
     ! vip_on "$1"
+}
+
+# 整组 VIP 是否全部在 / 全部不在
+vips_on() {
+    local v
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        remote_q "$1" "ip -o -4 addr show dev $IFACE | grep -q 'inet $v/'" || return 1
+    done
+    return 0
+}
+
+vips_absent() {
+    local v
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        remote_q "$1" "ip -o -4 addr show dev $IFACE | grep -q 'inet $v/'" && return 1
+    done
+    return 0
 }
 
 keepalived_entered() {
@@ -648,8 +790,8 @@ phase_p7_master_keepalived() {
     before=$(remote_q "$MASTER_NODE" "wc -l < $REPO/logs/keepalived-wrapper.log 2>/dev/null || echo 0")
     mark=$(remote_q "$MASTER_NODE" "date '+%F %T'")
     run_remote "$MASTER_NODE" "sudo -n systemctl restart keepalived"
-    wait_for "VIP $VIP 在主库 $MASTER_NODE" 60 1 vip_on "$MASTER_NODE" \
-        || die "主库未拿到 VIP（检查 keepalived 健康检查是否失败）" 4
+    wait_for "VIP 整组在主库 $MASTER_NODE（${VIP_CSV}）" 60 1 vips_on "$MASTER_NODE" \
+        || die "主库未拿到全部 VIP（检查 keepalived 健康检查是否失败）" 4
     wait_for "keepalived 进入 MASTER" 60 1 keepalived_entered "$MASTER_NODE" MASTER "$mark" \
         || die "keepalived 未进入 MASTER" 4
     wait_for "notify_master 全部成功" 180 2 notify_done "$MASTER_NODE" MASTER "$before" \
@@ -760,7 +902,7 @@ phase_p10_slave_keepalived() {
     before=$(remote_q "$SLAVE_NODE" "wc -l < $REPO/logs/keepalived-wrapper.log 2>/dev/null || echo 0")
     mark=$(remote_q "$SLAVE_NODE" "date '+%F %T'")
     run_remote "$SLAVE_NODE" "sudo -n systemctl restart keepalived"
-    wait_for "备库不持有 VIP" 60 1 vip_absent "$SLAVE_NODE" || die "备库抢到了 VIP" 5
+    wait_for "备库不持有任何 VIP" 60 1 vips_absent "$SLAVE_NODE" || die "备库抢到了 VIP" 5
     wait_for "keepalived 进入 BACKUP" 60 1 keepalived_entered "$SLAVE_NODE" BACKUP "$mark" \
         || die "备库未进入 BACKUP" 4
     wait_for "notify_backup 全部成功" 150 2 notify_done "$SLAVE_NODE" BACKUP "$before" \
@@ -780,8 +922,16 @@ phase_p10_slave_keepalived() {
 verify_acceptance() {
     phase "P11 验收"
     local fail=0
-    vip_on "$MASTER_NODE" && log "OK  VIP 在 $MASTER_NODE" || { warn "VIP 不在 $MASTER_NODE"; fail=1; }
-    vip_absent "$SLAVE_NODE" && log "OK  备库无 VIP" || { warn "备库有 VIP"; fail=1; }
+    vips_on "$MASTER_NODE" && log "OK  全部 VIP 在 $MASTER_NODE（${VIP_CSV}）" \
+        || { warn "主库未持有全部 VIP（当前: ${VIP_CSV}）"; fail=1; }
+    vips_absent "$SLAVE_NODE" && log "OK  备库无任何 VIP" || { warn "备库持有部分 VIP"; fail=1; }
+    local h
+    for h in "$MASTER_NODE" "$SLAVE_NODE"; do
+        local remote_csv
+        remote_csv=$(remote_q "$h" "cat /etc/keepalived/replica-vips 2>/dev/null | paste -sd, -") || remote_csv=""
+        [ "$remote_csv" = "$VIP_CSV" ] && log "OK  $h replica-vips 与部署参数一致" \
+            || { warn "$h replica-vips 不一致（$remote_csv != $VIP_CSV）"; fail=1; }
+    done
     if ((DRY_RUN)); then log "[dry-run] 跳过服务状态验收"; return 0; fi
 
     mysql_master_ok "$MASTER_NODE" "$MASTER_SID" && log "OK  主库可写" \
@@ -852,7 +1002,7 @@ main() {
     mkdir -p "$LOG_DIR"
     trap on_exit EXIT
 
-    log "部署目标: node1=$NODE1 node2=$NODE2 vip=$VIP master=$MASTER_NODE"
+    log "部署目标: node1=$NODE1 node2=$NODE2 vips=${VIP_CSV} 数据面=$VIP master=$MASTER_NODE"
     if ((FRESH)); then log "模式: --fresh（会清空两台 data 目录）"; fi
     if ((DRY_RUN)); then log "模式: --dry-run（只读）"; fi
 
@@ -870,7 +1020,7 @@ main() {
         die "验收未通过，见 $LOG_DIR" 5
     fi
     log "部署完成。日志: $LOG_DIR"
-    log "重装命令: $0 --node1 $NODE1 --node2 $NODE2 --vip $VIP --fresh --yes"
+    log "重装命令: $0 --node1 $NODE1 --node2 $NODE2 --vip-list \"$VIP_CSV\" --fresh --yes"
 }
 
 main "$@"

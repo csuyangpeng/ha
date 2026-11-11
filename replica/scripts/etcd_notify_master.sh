@@ -97,7 +97,7 @@ fi
 # 3. 输出集群状态
 echo "集群状态:" 2>&1 | _ts_pipe >> "$LOG"
 docker exec etcd etcdctl endpoint status \
-    --endpoints=http://10.18.1.27:2379,http://10.18.1.28:2379,http://10.18.1.30:23790 \
+    --endpoints="http://${NODE1}:2379,http://${NODE2}:2379,http://${MYSQL_VIP}:23790" \
     --write-out=table 2>&1 | _ts_pipe >> "$LOG"
 
 echo "[ETCD-MASTER] 切换完成" 2>&1 | _ts_pipe >> "$LOG"

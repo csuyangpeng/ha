@@ -4,7 +4,9 @@
 # 基础配置
 NODE1="10.18.1.27"
 NODE2="10.18.1.28"
-VIP="10.18.1.30"
+# 整组漂移的 VIP；第 1 个是数据面 VIP
+VIPS=("10.18.1.30")
+VIP="${VIPS[0]%%/*}"
 MYSQL_USER="root"
 MYSQL_PASSWORD="s<9!Own1z4"
 
@@ -27,6 +29,28 @@ check_vip_location() {
         echo ""
         log "警告: 未找到VIP"
     fi
+}
+
+# 节点是否持有全部 VIP（整组应同漂）
+check_all_vips() {
+    local node=$1 v
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        ssh "$node" "ip addr show | grep -q 'inet $v/'" 2>/dev/null || return 1
+    done
+    return 0
+}
+
+# 节点是否不持有任何 VIP
+check_no_vips() {
+    local node=$1 v
+    for v in "${VIPS[@]}"; do
+        v=${v%%/*}
+        if ssh "$node" "ip addr show | grep -q 'inet $v/'" 2>/dev/null; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 # 检查MySQL容器状态
@@ -138,7 +162,17 @@ test_vip_switch() {
     new_vip=$(check_vip_location)
     if [ "$new_vip" = "$target_node" ]; then
         log "✓ VIP切换成功: $current_vip -> $target_node"
-        
+        if check_all_vips "$target_node"; then
+            log "✓ 全部 VIP 已整组切换"
+        else
+            log "✗ 仅部分 VIP 切换（整组应同漂）"
+        fi
+        if check_no_vips "$current_vip"; then
+            log "✓ 原节点已释放全部 VIP"
+        else
+            log "✗ 原节点仍持有 VIP（脑裂风险）"
+        fi
+
         # 6. 恢复服务
         log "恢复 $current_vip 的keepalived..."
         ssh $current_vip "sudo systemctl start keepalived"

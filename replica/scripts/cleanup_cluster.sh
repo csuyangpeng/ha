@@ -20,7 +20,10 @@ set -Eeuo pipefail
 # ---------------- 默认值 ----------------
 NODE1="10.18.1.27"
 NODE2="10.18.1.28"
+VIPS_STR="10.18.1.30"
 VIP="10.18.1.30"
+VIPS=("10.18.1.30")
+VIPS_CSV="10.18.1.30"
 IFACE="ens3"
 ASSUME_YES=0
 DRY_RUN=0
@@ -45,7 +48,8 @@ usage() {
 
   --node1 IP     节点 1（默认 $NODE1）
   --node2 IP     节点 2（默认 $NODE2）
-  --vip IP       虚拟 IP（默认 $VIP）
+  --vip IP       单个虚拟 IP（默认 $VIP）
+  --vip-list L   虚拟 IP 列表，逗号分隔（与部署时一致）
   --iface NAME   网卡（默认 $IFACE）
   --yes          非交互确认（不询问）
   --dry-run      只检查连通性并打印将要执行的操作
@@ -58,7 +62,8 @@ parse_args() {
         case "$1" in
             --node1)   NODE1=${2:?}; shift 2 ;;
             --node2)   NODE2=${2:?}; shift 2 ;;
-            --vip)     VIP=${2:?}; shift 2 ;;
+            --vip)     VIPS_STR=${2:?}; shift 2 ;;
+            --vip-list) VIPS_STR=${2:?}; shift 2 ;;
             --iface)   IFACE=${2:?}; shift 2 ;;
             --yes)     ASSUME_YES=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
@@ -67,9 +72,27 @@ parse_args() {
         esac
     done
 
-    [[ $NODE1 =~ ^[0-9.]+$ && $NODE2 =~ ^[0-9.]+$ && $VIP =~ ^[0-9.]+$ ]] \
-        || die "--node1/--node2/--vip 必须是 IPv4 地址" 2
+    [[ $NODE1 =~ ^[0-9.]+$ && $NODE2 =~ ^[0-9.]+$ ]] \
+        || die "--node1/--node2 必须是 IPv4 地址" 2
     [ "$NODE1" != "$NODE2" ] || die "node1 与 node2 不能相同" 2
+
+    local item ip seen=" "
+    local -a raw=() uniq=()
+    IFS=',' read -r -a raw <<<"$VIPS_STR"
+    for item in "${raw[@]}"; do
+        item=${item//[[:space:]]/}
+        [ -n "$item" ] || continue
+        ip=${item%%/*}
+        [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "非法 VIP: $item" 2
+        case "$seen" in *" $ip "*) continue ;; esac
+        seen+="$ip "
+        uniq+=("$ip")
+    done
+    [ "${#uniq[@]}" -gt 0 ] || die "--vip-list 不能为空" 2
+    VIPS=("${uniq[@]}")
+    VIP="${VIPS[0]}"
+    printf -v VIPS_CSV '%s,' "${VIPS[@]}"
+    VIPS_CSV=${VIPS_CSV%,}
 }
 
 # ---------------- 远程执行 ----------------
@@ -120,14 +143,15 @@ preflight_node() {
 # ---------------- 清理 ----------------
 cleanup_node() {
     local h=$1
-    run_script "$h" "$IFACE" "$VIP" "$REPO" <<'EOS'
+    run_script "$h" "$IFACE" "$VIPS_CSV" "$REPO" <<'EOS'
 set -uo pipefail
-IFACE_=$1; VIP_=$2; REPO_=$3
+IFACE_=$1; VIPS_CSV=$2; REPO_=$3
+IFS=',' read -r -a VIPS_ <<<"$VIPS_CSV"
 
 echo "--- keepalived ---"
 sudo -n systemctl stop keepalived 2>/dev/null || true
 sudo -n pkill -f restore_mysql_slave.sh 2>/dev/null || true
-sudo -n rm -f /etc/keepalived/replica-runner.sh
+sudo -n rm -f /etc/keepalived/replica-runner.sh /etc/keepalived/replica-vips
 
 # 恢复部署前备份：跳过任何仍引用 replica-runner 的备份
 restored=0
@@ -172,7 +196,9 @@ sudo -n rm -f /tmp/master_dump.sql /tmp/master_dump_local.sql /tmp/keepalived.co
 
 echo "--- 当前状态 ---"
 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -xE 'mysql|redis|etcd|etcdvip' || true
-ip -o -4 addr show dev "$IFACE_" 2>/dev/null | grep "inet ${VIP_}/" || true
+for v in "${VIPS_[@]}"; do
+    ip -o -4 addr show dev "$IFACE_" 2>/dev/null | grep "inet ${v}/" || true
+done
 true
 EOS
 }
@@ -181,14 +207,18 @@ EOS
 verify_node() {
     local h=$1 residue
     if ((DRY_RUN)); then log "[dry-run] 跳过 $h 校验"; return 0; fi
-    residue=$(remote_script "$h" "$IFACE" "$VIP" "$REPO" <<'EOS'
+    residue=$(remote_script "$h" "$IFACE" "$VIPS_CSV" "$REPO" <<'EOS'
 set -uo pipefail
-IFACE_=$1; VIP_=$2; REPO_=$3
+IFACE_=$1; VIPS_CSV=$2; REPO_=$3
+IFS=',' read -r -a VIPS_ <<<"$VIPS_CSV"
 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -xE 'mysql|redis|etcd|etcdvip' || true
 sudo -n find "$REPO_/data" -mindepth 2 -print -quit 2>/dev/null || true
 systemctl is-active keepalived 2>/dev/null | grep -qx active && echo "keepalived=active" || true
-ip -o -4 addr show dev "$IFACE_" 2>/dev/null | grep "inet ${VIP_}/" || true
+for v in "${VIPS_[@]}"; do
+    ip -o -4 addr show dev "$IFACE_" 2>/dev/null | grep "inet ${v}/" || true
+done
 [ -e /etc/keepalived/replica-runner.sh ] && echo "残留 /etc/keepalived/replica-runner.sh" || true
+[ -e /etc/keepalived/replica-vips ] && echo "残留 /etc/keepalived/replica-vips" || true
 ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E ':(3306|6379|2379|2380|23790|23800)$' || true
 true
 EOS
@@ -206,7 +236,7 @@ main() {
     mkdir -p "$LOG_DIR"
     parse_args "$@"
 
-    log "清理 replica 集群：$NODE1 / $NODE2，VIP $VIP，网卡 $IFACE"
+    log "清理 replica 集群：$NODE1 / $NODE2，VIP $VIPS_CSV，网卡 $IFACE"
     log "日志: $LOG_FILE"
     if ((DRY_RUN)); then log "模式: dry-run（不修改任何东西）"; fi
 

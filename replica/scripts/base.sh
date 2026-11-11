@@ -18,12 +18,22 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 # ---- 网络 ----
 IFACE="ens3"
-MYSQL_VIP="10.18.1.30"
+# 整组漂移的 VIP；第 1 个是数据面 VIP（MySQL/Redis/etcdvip 客户端使用）。
+# deploy_cluster.sh 会按 --vip-list 重写这一行。
+VIPS=("10.18.1.30")
+MYSQL_VIP="${VIPS[0]%/*}"
 NODE1="10.18.1.27"
 NODE2="10.18.1.28"
 
-LOCAL_IP=$(ip -o -4 addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -E '^10\.18\.1\.(27|28)$' | head -1)
+LOCAL_IP=$(ip -o -4 addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Fx -e "$NODE1" -e "$NODE2" | head -1)
 [ -n "$LOCAL_IP" ] || LOCAL_IP=$(hostname -I | awk '{print $1}')
+
+# ---- coremgr / 核心网健康 ----
+COREMGR_PORT=8888
+COREMGR_HEALTH_URL=""                       # 留空则用 http://<peer>:$COREMGR_PORT/coremgr/ha/health
+NF_HEALTH_FILE="/var/run/coremgr_nf_health"
+CORE_GATE=1                                 # MASTER 的 core 健康是否参与释放 VIP
+CORE_PEER_GATE_MYSQL=1                      # MySQL 硬故障时是否要求对端 core 就绪
 
 # ---- 凭据 ----
 MYSQL_USER="root"
@@ -57,6 +67,38 @@ redis_cli() {
     docker exec -i redis redis-cli -a "$REDIS_PASS" "$@" 2>/dev/null
 }
 
-is_on_vip() {
-    ip addr show dev "$IFACE" 2>/dev/null | grep -q "inet $MYSQL_VIP/"
+# ---- VIP 判定 ----
+bare_vip() { echo "${1%%/*}"; }
+
+holds_vip() {   # holds_vip 10.18.1.31[/24]
+    local ip=${1%%/*}
+    ip addr show dev "$IFACE" 2>/dev/null | grep -q "inet ${ip}/"
 }
+
+held_vip_count() {
+    local v n=0
+    for v in "${VIPS[@]}"; do
+        holds_vip "$v" && n=$((n + 1))
+    done
+    echo "$n"
+}
+
+missing_vips() {   # 本机未持有的 VIP，一行一个
+    local v
+    for v in "${VIPS[@]}"; do
+        holds_vip "$v" || echo "${v%%/*}"
+    done
+}
+
+all_vips_held() { [ "$(held_vip_count)" -eq "${#VIPS[@]}" ]; }
+
+peer_ip() {
+    case "$LOCAL_IP" in
+        "$NODE1") echo "$NODE2" ;;
+        "$NODE2") echo "$NODE1" ;;
+        *) echo "" ;;
+    esac
+}
+
+# 角色只看数据面 VIP：MySQL/Redis/etcdvip 都以它为入口。
+is_on_vip() { holds_vip "$MYSQL_VIP"; }

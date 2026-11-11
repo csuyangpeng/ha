@@ -3,7 +3,9 @@
 
 # Keepalived 节点配置
 KEEPALIVED_NODES=("10.18.1.27" "10.18.1.28")
-VIP="10.18.1.30"
+# 整组漂移的 VIP；第 1 个是数据面 VIP
+VIPS=("10.18.1.30")
+VIP="${VIPS[0]%%/*}"
 
 # MySQL 配置
 MYSQL_USER="root"

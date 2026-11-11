@@ -23,11 +23,12 @@
 BASE="/home/sder/ha/replica/scripts"
 
 case "${1:-}" in
-    check)  exec "$BASE/check_mysql_status.sh" ;;
-    master) exec "$BASE/notify_master.sh" ;;
-    backup) exec "$BASE/notify_slave.sh" ;;
+    check)      exec "$BASE/check_mysql_status.sh" ;;
+    check-core) exec "$BASE/check_core_status.sh" "${2:-status}" ;;
+    master)     exec "$BASE/notify_master.sh" ;;
+    backup)     exec "$BASE/notify_slave.sh" ;;
     *)
-        echo "usage: $0 {check|master|backup}" >&2
+        echo "usage: $0 {check|check-core [status|gate]|master|backup}" >&2
         exit 2
         ;;
 esac

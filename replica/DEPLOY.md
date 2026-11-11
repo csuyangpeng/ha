@@ -11,7 +11,7 @@
 
 ### 0.1 端口与 VRID 冲突：TiDB 已停机，当前不冲突
 
-（2026-11-06 复核）两台节点上的 TiDB 容器与 keepalived 均已停止，2379/2380/3306/6379/23790/23800 全部空闲，可以按标准配置部署。
+（2026-11-06 复核）两台节点上的 TiDB 容器与 keepalived 均已停止，2379/2380/3306/6379/23790/23800 全部空闲，可以按标准配置部署。coremgr 使用 8888，部署前确认未被占用（`ss -lntp | grep :8888`）。
 
 仍需注意：
 
@@ -55,10 +55,12 @@
 
 | 节点 | IP | 角色 | 运行组件 |
 |---|---|---|---|
-| node1 | 10.18.1.27 | 初始 MASTER | mysql / redis(master) / etcd1 / etcdvip |
-| node2 | 10.18.1.28 | 初始 BACKUP | mysql(slave) / redis(slave) / etcd2 |
-| VIP | 10.18.1.30 | 漂移地址 | 由 keepalived 持有，etcdvip 绑定其 23790 |
+| node1 | 10.18.1.27 | 初始 MASTER | mysql / redis(master) / etcd1 / etcdvip / coremgr |
+| node2 | 10.18.1.28 | 初始 BACKUP | mysql(slave) / redis(slave) / etcd2 / coremgr |
+| VIP 组 | `10.18.1.30`（+ 可选 `10.18.1.31` 等） | 整组漂移 | 由 keepalived 持有；第 1 个是数据面 VIP，etcdvip 绑定其 23790 |
 
+- 一个 VRRP 实例承载多个 `virtual_ipaddress`：**整组同漂**，不存在只漂一半的状态。VIP 清单由
+  `/etc/keepalived/replica-vips` 统一写入，coremgr 也读这份文件，避免两边配置不一致。
 - keepalived：host 层运行，不是容器；`unicast` 模式，只在两台之间发 VRRP。
 - MySQL：单主单从，GTID + ROW + `log-slave-updates`。
 - Redis：单主单从，AOF，角色由 notify 脚本用 `SLAVEOF` 切换。
@@ -73,6 +75,11 @@
 | etcd | 2379 / 2380 | 客户端 / 集群通信 |
 | etcdvip | 23790 / 23800 | 客户端 / 集群通信，仅主节点 |
 | keepalived | 112 (VRRP) | 仅两台之间 unicast |
+| coremgr | 8888 | HA 状态接口 `/coremgr/ha/*`；`/coremgr/ha/health` 供对端查询核心网健康 |
+| core NF 探活 | 29510、29502 等 | 各 NF 自带的本地 HTTP 端口，仅 coremgr 从 `127.0.0.1` 探活，不对 VIP 暴露 |
+
+> NF 探活端口以实际部署为准。默认配置里 `nrf` 用 `http://127.0.0.1:29510/health_check`，
+> `smf` 用 `http://127.0.0.1:29502/health`，其余 NF 同样按其真实端口填写完整 URL（见 7.4）。
 
 ### 1.3 切换时各组件做什么
 
@@ -80,11 +87,20 @@
 |---|---|---|
 | 成为 MASTER | `notify_master.sh` | MySQL：`STOP SLAVE` → `RESET SLAVE ALL` → `read_only=OFF` → `FLUSH BINARY LOGS`；Redis：`SLAVEOF NO ONE`；etcd：启动 etcdvip 容器 |
 | 成为 BACKUP | `notify_slave.sh` | MySQL：`read_only=ON` → `RESET MASTER` → `CHANGE MASTER TO VIP` → `START SLAVE`；Redis：`SLAVEOF VIP 6379`；etcd：停止 etcdvip，重启 etcd |
-| FAULT / STOP | 当前未配置 | 见问题 #6，建议也指向 `notify_slave.sh` |
+| FAULT / STOP | `replica-runner.sh fault` | 按 BACKUP 处理：释放 VIP，MySQL/Redis 回到从库角色 |
+| 健康判定 | `check_mysql_status.sh` | MASTER：MySQL 可用/可写 → **核心网聚合 verdict 就绪** → 通过；BACKUP：始终 exit 0 |
+
+切换判定顺序（MASTER 侧）：
+
+1. MySQL 硬故障（进程/连接/可写性）→ exit 1，释放 VIP；若对端核心网明确未就绪，则暂不释放（见 7.4）。
+2. MySQL 正常后查 `check_core_status.sh gate`：`enforce=0`、verdict 过期或本地只是 grace → 不切换；critical NF 确认故障且**对端 ready=1** → exit 1。
+3. 对端也异常 → 保持现状并告警，避免把 VIP 交给一个同样不可用的节点。
 
 ### 1.4 容灾指标
 
-- VIP 漂移：约 3~4 秒（`advert_int 1`，丢 3 个通告）。
+- VIP 漂移：keepalived 层面约 3~4 秒（`advert_int 1`，丢 3 个通告）。
+- 核心网参与判定后的整链路：coremgr 连续 2 次探测（10s）+ keepalived `fall 3 × interval 5`（15s），最坏约 25~30 秒才触发倒换。这是有意的去抖，避免 NF 抖动造成来回切。
+- 多 VIP 整组同漂，不提供单 VIP 独立漂移。
 - MySQL / Redis 都是异步复制：**RPO > 0**，主库宕机前未复制的事务会丢。
 - 切换后客户端必须重连并重试；应用侧建议配连接重试与只读判断。
 
@@ -343,17 +359,33 @@ etcd1=http://10.18.1.27:2380,etcd2=http://10.18.1.28:2380,etcdvip=http://10.18.1
 ```bash
 cd /home/sder/ha/replica
 ./scripts/deploy_cluster.sh \
-  --node1 10.18.1.27 --node2 10.18.1.28 --vip 10.18.1.30 \
+  --node1 10.18.1.27 --node2 10.18.1.28 --vip-list "10.18.1.30" \
   --fresh --yes
 ```
 
-执行内容：同步仓库（不改节点数据）→ 逐台渲染 `docker-compose.yaml` / `base.sh` / keepalived → etcd 首次 bootstrap（`ETCD_CLUSTER_STATE=new` 仅通过命令环境传入，`.env` 始终保留 `existing`）→ 主库 MySQL/Redis → 主库 keepalived、VIP、etcdvip → 备库 MySQL 复制 → 备库 Redis → 备库 keepalived → 全量验收。
+双 VIP 示例（整组同漂，第一个是数据面 VIP）：
+
+```bash
+./scripts/deploy_cluster.sh \
+  --node1 10.18.1.27 --node2 10.18.1.28 \
+  --vip-list "10.18.1.30,10.18.1.31/24" \
+  --coremgr-port 8888 --nf-health-file /var/run/coremgr_nf_health \
+  --fresh --yes
+```
+
+执行内容：同步仓库（不改节点数据）→ 逐台渲染 `docker-compose.yaml` / `base.sh` / keepalived → etcd 首次 bootstrap（`ETCD_CLUSTER_STATE=new` 仅通过命令环境传入，`.env` 始终保留 `existing`）→ 主库 MySQL/Redis → 主库 keepalived、VIP 组、etcdvip → 备库 MySQL 复制 → 备库 Redis → 备库 keepalived → 全量验收。
+
+部署还会写 `/etc/keepalived/replica-vips`（一行一个 VIP，root:root 0644），作为 keepalived 与 coremgr 的**唯一 VIP 事实源**；验收会核对它与渲染出的 `virtual_ipaddress` 完全一致。compose 中 etcdvip 的 `VIP:23790/23800` 也按数据面 VIP 重写。
 
 常用参数：
 
 | 参数 | 说明 |
 | --- | --- |
-| `--node1/--node2/--vip/--iface` | 覆盖默认的 .27/.28/.30/ens3 |
+| `--node1/--node2/--iface` | 覆盖默认的 .27/.28/ens3 |
+| `--vip IP` | 单个 VIP，等价于 `--vip-list` 只有一个元素（默认 `10.18.1.30`） |
+| `--vip-list "IP[,IP...]"` | VIP 组，逗号分隔；第 1 个是数据面 VIP；可带 `/前缀`（缺省 `/24`） |
+| `--coremgr-port N` | coremgr 端口，渲染进 `base.sh`，用于查询对端核心网健康（默认 8888） |
+| `--nf-health-file P` | coremgr 写入的 verdict 文件路径（默认 `/var/run/coremgr_nf_health`） |
 | `--master 10.18.1.28` | 指定初始主库（默认 node1） |
 | `--fresh` | 允许清空两台的 `data/mysql`、`data/redis`、`data/etcd1`、`data/etcd2` |
 | `--yes` | 非交互确认（配合 `--fresh`） |
@@ -361,7 +393,7 @@ cd /home/sder/ha/replica
 
 安全边界：
 
-- 只要任意一台检测到**非空数据目录、同名容器、运行中的 keepalived 或已存在的 VIP**，脚本会拒绝执行；必须显式 `--fresh` 才会清空。
+- 只要任意一台检测到**非空数据目录、同名容器、运行中的 keepalived 或已存在的 VIP（组内任意一个）**，脚本会拒绝执行；必须显式 `--fresh` 才会清空。
 - 非 `--fresh` 模式可安全重复执行：已有数据不会被删除。
 - 首次 MySQL 初始化约 5 分钟（InnoDB + 时区数据），脚本让两台并行初始化，整体约 6～8 分钟。
 - 失败时自动收集两台节点的容器日志、keepalived journal、wrapper log 到 `/tmp/replica-deploy-<时间戳>/`；退出码 0 成功 / 2 参数 / 3 预检拒绝 / 4 等待超时 / 5 校验失败。
@@ -375,18 +407,19 @@ cd /home/sder/ha/replica
 ```bash
 cd /home/sder/ha/replica
 ./scripts/cleanup_cluster.sh \
-  --node1 10.18.1.27 --node2 10.18.1.28 --yes
+  --node1 10.18.1.27 --node2 10.18.1.28 --vip-list "10.18.1.30" --yes
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `--node1/--node2/--vip/--iface` | 覆盖默认的 .27/.28/.30/ens3 |
+| `--node1/--node2/--iface` | 覆盖默认的 .27/.28/ens3 |
+| `--vip IP` / `--vip-list L` | 与部署时一致，用于检查每个 VIP 是否还有残留；默认 `10.18.1.30` |
 | `--yes` | 非交互确认；不加则要求输入 `DELETE` |
 | `--dry-run` | 只检查 ssh/sudo/docker 连通性并打印动作，不修改任何东西 |
 
 清理内容：
 
-- **keepalived**：停止服务，删除 `/etc/keepalived/replica-runner.sh`；`keepalived.conf` 从 `keepalived.conf.bak.*` 里恢复**部署前**的版本（跳过仍引用 `replica-runner` 的备份），没有可用备份则删除配置并 `disable keepalived`
+- **keepalived**：停止服务，删除 `/etc/keepalived/replica-runner.sh` 与 `/etc/keepalived/replica-vips`；`keepalived.conf` 从 `keepalived.conf.bak.*` 里恢复**部署前**的版本（跳过仍引用 `replica-runner` 的备份），没有可用备份则删除配置并 `disable keepalived`
 - **容器**：`docker compose down --remove-orphans` + 强制删除 `mysql` / `redis` / `etcd` / `etcdvip`
 - **数据**：`data/mysql`、`data/redis`、`data/etcd1`、`data/etcd2`
 - **日志与运行态**：`logs/*.log`、`/var/run/replica_*`、`/tmp/master_dump*.sql`、`/tmp/keepalived.conf.new`
@@ -586,7 +619,29 @@ sudo cp /etc/keepalived/keepalived.conf /etc/keepalived/keepalived.conf.bak.$(da
 sudo cp /home/sder/ha/replica/scripts/keepalived.conf /etc/keepalived/keepalived.conf   # .28: keepalived.28.conf
 ```
 
-两份文件的唯一差异：`priority`（.27=150 / .28=100）、`unicast_src_ip`、`unicast_peer`。关键段落：
+两份文件的差异：`priority`（.27=150 / .28=100）、`unicast_src_ip`、`unicast_peer`。VIP/peer 段落在模板里用
+`# @@VIP_BEGIN@@ / @@VIP_END@@` 与 `# @@PEER_BEGIN@@ / @@PEER_END@@` 标记包起来，`deploy_cluster.sh` 按这两个标记
+重写；手工部署时直接编辑标记之间的行即可（每个 VIP 一行，前缀缺省 `/24`）。
+
+多 VIP 时 `virtual_ipaddress` 写多行，其余不变：
+
+```
+    virtual_ipaddress {
+        # @@VIP_BEGIN@@
+        10.18.1.30/24 dev ens3
+        10.18.1.31/24 dev ens3
+        # @@VIP_END@@
+    }
+```
+
+同时写 VIP 事实源文件（coremgr 优先读它；两台的列表必须一致）：
+
+```bash
+printf '%s\n' 10.18.1.30/24 10.18.1.31/24 | sudo tee /etc/keepalived/replica-vips >/dev/null
+sudo chown root:root /etc/keepalived/replica-vips && sudo chmod 644 /etc/keepalived/replica-vips
+```
+
+关键段落：
 
 ```
 global_defs {
@@ -616,7 +671,11 @@ vrrp_instance VI_MYSQL_HA {
 
     authentication { auth_type PASS  auth_pass Rp251ha }
 
-    virtual_ipaddress { 10.18.1.30/24 dev ens3 }
+    virtual_ipaddress {
+        # @@VIP_BEGIN@@
+        10.18.1.30/24 dev ens3      # 多 VIP 直接加行，整组同漂
+        # @@VIP_END@@
+    }
 
     track_script { chk_mysql_ha }
 
@@ -629,7 +688,7 @@ vrrp_instance VI_MYSQL_HA {
 
 > `track_script` 不配 `weight`：检查失败时实例直接进 FAULT、释放 VIP，备节点才能接管。
 > `notify_fault` / `notify_stop` 是原仓库配置里缺失的，补上才能保证 keepalived 异常退出时 MySQL/Redis 被降级。
-> 健康检查语义（`check_mysql_status.sh`）：**MASTER 侧** MySQL 不可用或 `read_only != 0` 才返回 1；**BACKUP 侧永远返回 0**，否则备节点会自己进 FAULT、无法接管。提升过程中靠 `/var/run/replica_promoting` 标记给出 120 秒宽限期，避免"先拿 VIP 后改 read_only"的时序误判。
+> 健康检查语义（`check_mysql_status.sh`）：**MASTER 侧** MySQL 不可用或 `read_only != 0` 才返回 1；MySQL 正常时还要通过核心网 gate（见 7.4），gate 要求切换时才返回 1，其余情况返回 0；**BACKUP 侧永远返回 0**，否则备节点会自己进 FAULT、无法接管。提升过程中靠 `/var/run/replica_promoting` 标记给出 120 秒宽限期，避免"先拿 VIP 后改 read_only"的时序误判。
 
 ### 7.3 校验并加载
 
@@ -640,8 +699,25 @@ sudo keepalived -t -f /etc/keepalived/keepalived.conf; echo "exit=$?"
 # 单独跑一次健康检查，确认 runner 与脚本链路正常（BACKUP 侧返回 0 属正常）
 sudo /etc/keepalived/replica-runner.sh check; echo "check-exit=$?"
 
+# 单独看核心网 gate 与聚合状态（不改变 keepalived）
+sudo /etc/keepalived/replica-runner.sh check-core status
+
 # 配置已整份替换（无 VI_TIDB），直接启动
 sudo systemctl start keepalived
+```
+
+`check-core status` 会打印本地 verdict 的关键字段、是否新鲜、以及当前会给出 exit 0 还是 1；`check-core gate`
+只输出判定结果（0/1）并写告警，适合放进其他巡检脚本。
+
+```bash
+# 本机 verdict（coremgr 每 5 秒原子重写）
+sudo cat /var/run/coremgr_nf_health
+
+# 对端 verdict（coremgr 的 HTTP 视图，AllowNode）
+curl -fsS --max-time 2 http://10.18.1.28:8888/coremgr/ha/health
+
+# 本机 HA 汇总（VIP 持有、MySQL/Redis/etcd、核心网状态）
+curl -fsS http://127.0.0.1:8888/coremgr/ha/status
 ```
 
 **顺序很重要**：
@@ -663,13 +739,51 @@ sudo tcpdump -i ens3 -n vrrp -c 5
 tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
 ```
 
+### 7.4 核心网健康参与切换
+
+5GC 的 NF（smf/nrf/ausf/udm/pcf/nssf）异常不再只靠人工发现，而是由 coremgr 聚合后交给 keepalived 判定。
+keepalived **不直接探活 NF**，只看一个结论；这样探活逻辑、阈值、重启策略都在 coremgr 内演进，keepalived 配置保持稳定。
+
+- coremgr 每 5 秒并发 `GET` 各 NF 的完整 URL，2xx 记为健康；连续 `fail_threshold` 次失败才置 `down`，
+  连续 `rise_threshold` 次成功才恢复。配置在节点的
+  `/usr/local/coremgr/config/cm_sys_conf.yaml` 的 `ha.nf_health`（仓库模板见 `oam/cm/data/cm_sys_conf.yaml`）。
+- 级别：`critical`（默认 `nrf`、`smf`）故障会导致 `ready=0`，参与倒换；`important`（其余）故障只告警/尝试本地重启，
+  不阻塞 `ready`。
+- `enforce: false` 时 verdict 照常生成，但不参与切换（观察模式）；确认探活 URL 全部正确后再打开。
+- `restart_enable: true` 时，`important` NF 连续故障会由 coremgr 通过容器管理接口原地重启，并受冷却时间、
+  时间窗内次数上限约束；手动倒换进行中、处于提升宽限期、或正在执行 init/start/stop/upgrade/patch/rollback 时不会重启。
+- 探活 URL 必须写真实路径：NRF 是 `/health_check`，不是 `/health`。用
+  `curl -sS -o /dev/null -w '%{http_code}\n' <url>` 逐条确认后再打开 enforce。
+
+判定语义（`check_core_status.sh`）：
+
+| 场景 | MASTER 侧结果 |
+|---|---|
+| `enforce=0` | 0（观察模式，不影响切换） |
+| verdict 缺失/过期/`poller≠up` | 0（未知不切，告警 `core_stale` / `core_missing`） |
+| `ready=1` | 0 |
+| `ready=0` 但 `critical_down=0`（仍在 grace/恢复中） | 0 |
+| critical NF 确认故障且**对端 `ready=1`** | 1 → 释放 VIP，触发倒换 |
+| critical NF 故障且**对端未就绪/不可达** | 0 → 保持现状，告警“暂不切换”，避免双方都不可用 |
+| BACKUP 侧 | 永远 0（否则备机无法接管） |
+
+MySQL 硬故障路径额外做对端检查：`CORE_PEER_GATE_MYSQL=1`（默认）时，若对端 verdict 明确未就绪则暂不切换；
+对端端点不可用（例如旧版 coremgr 没有 `/coremgr/ha/health`）则按原 MySQL 故障逻辑切换并告警。
+
+回滚/降噪：
+
+- 只想关掉核心网参与切换：把 `nf_health.enforce` 置 `false` 并重启 coremgr，无需改 keepalived。
+- 只想关掉自动重启：`restart_enable: false`。
+- 调整阈值：`interval`、`fail_threshold`、`grace`、`stale_after`；`stale_after` 必须大于 `interval`。
+- 升级 NF 前先置 `enforce: false` 可以避免滚动升级期间判为故障；升级完恢复。
+
 ---
 
 ## 8. 端到端验收清单
 
 | # | 检查项 | 命令 | 期望 |
 |---|---|---|---|
-| 1 | VIP 只在一台 | `ip -o -4 addr show ens3 \| grep 10.18.1.30` | 仅 .27 有 |
+| 1 | VIP 组只在一台、整组齐全 | `ip -o -4 addr show ens3 \| grep -E '10\.18\.1\.(30\|31)'` | 仅 .27 同时有 .30/.31；.28 一个都没有 |
 | 2 | MySQL 可写 | `mysql -h 10.18.1.30 -uroot -p's<9!Own1z4' -e "SELECT @@server_id, @@read_only"` | server_id=27，read_only=0 |
 | 3 | 从库复制正常 | 在 .28 `SHOW SLAVE STATUS\G` | IO/SQL 均 Yes，延迟 0 |
 | 4 | 从库只读 | 在 .28 `SELECT @@read_only, @@super_read_only` | 1 / 1 |
@@ -678,12 +792,17 @@ tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
 | 7 | etcd leader 唯一 | `endpoint status --write-out=table` | 恰好 1 个 true |
 | 8 | etcdvip | 在主节点 `docker ps \| grep etcdvip`；`etcdctl --endpoints=http://10.18.1.30:23790 endpoint status` | 容器运行、端点可查 |
 | 9 | 备节点无 etcdvip | 在 .28 `docker ps \| grep etcdvip` | 无输出 |
-| 10 | 端口监听 | `sudo ss -lntp \| grep -E ':(3306\|6379\|2379\|2380\|23790\|23800)\b'` | 全部有进程 |
+| 10 | 端口监听 | `sudo ss -lntp \| grep -E ':(3306\|6379\|2379\|2380\|23790\|23800\|8888)\b'` | 全部有进程 |
 | 11 | 脚本日志 | `tail -50 /home/sder/ha/replica/logs/keepalived-wrapper.log` | 无 `command not found` / 无报错 |
 | 12 | 已无 TiDB 实例 | `grep -c VI_TIDB /etc/keepalived/keepalived.conf` | 0 |
 | 13 | 健康检查链路 | `sudo /etc/keepalived/replica-runner.sh check; echo $?` | 0 |
 | 14 | 授时链路（见 2.5） | .27 `chronyc tracking`；.28 `chronyc sources -v` | .27 Stratum 10、本地时基；.28 `^* 10.18.1.27` |
 | 15 | 两台时钟差 | `ssh 10.18.1.28 'date +%s.%N'; date +%s.%N` | 差 < 0.1s |
+| 16 | VIP 事实源一致 | `cat /etc/keepalived/replica-vips`；对比 `keepalived.conf` 的 `virtual_ipaddress` | 两台内容一致，且与配置逐行对应 |
+| 17 | verdict 新鲜 | `stat -c %Y /var/run/coremgr_nf_health`；`cat /var/run/coremgr_nf_health` | 时间在 20s 内，`poller=up` |
+| 18 | 对端 health 可达 | `curl -fsS --max-time 2 http://10.18.1.28:8888/coremgr/ha/health` | 返回 key=value，`node` 为 .28 |
+| 19 | 核心网结论 | `sudo /etc/keepalived/replica-runner.sh check-core status` | 全部 NF healthy，`ready=1`；MASTER 侧 gate=0 |
+| 20 | NF 探活路径 | 对每个配置 URL 执行 `curl -sS -o /dev/null -w '%{http_code}'` | 200/2xx（NRF 用 `/health_check`） |
 
 ---
 
@@ -695,8 +814,8 @@ tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
 # 1) 在持有 VIP 的节点（假定 .27）执行
 sudo systemctl stop keepalived
 
-# 2) 约 5~8 秒后在 .28 检查
-ip -o -4 addr show ens3 | grep 10.18.1.30
+# 2) 约 5~8 秒后在 .28 检查（整组 VIP 应一起出现，.27 上一个不剩）
+ip -o -4 addr show ens3 | grep -E '10\.18\.1\.(30|31)'
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SELECT @@server_id, @@read_only; SHOW SLAVE STATUS\G"
 docker exec -i redis redis-cli -a 'A8K5h7+6!?' info replication | grep role:
 docker ps | grep etcdvip
@@ -715,7 +834,7 @@ mysql -h 10.18.1.30 -uroot -p's<9!Own1z4' \
 sudo systemctl start keepalived
 
 # 等待 10 秒后检查：.27 应处于 BACKUP（nopreempt 不抢回 VIP）
-ip -o -4 addr show ens3 | grep 10.18.1.30        # 仍然在 .28
+ip -o -4 addr show ens3 | grep -E '10\.18\.1\.(30|31)'   # 整组仍然只在 .28
 docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" | grep -E "Master_Host|Slave_IO_Running"
 ```
 
@@ -726,6 +845,17 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" | grep
 - 节点级故障（关机 / 断网）会触发 VIP 漂移。
 - 单组件故障：`check_mysql_status.sh` 已修正，MASTER 侧 `docker stop mysql` 会连续 3 次（`fall 3`，约 15 秒）检查失败 → 实例进 FAULT、释放 VIP → 备节点接管。BACKUP 侧 MySQL 或复制异常**不会**导致自身 FAIL（只告警 + 异步重建），这是刻意设计。
 - 演练后如需重建备库：查看 `logs/keepalived-wrapper.log` 中的 `异步执行从库重建` 与 `=== 重建完成 ===`，或手工执行 `restore_mysql_slave.sh`。
+
+核心网故障注入（`enforce: true` 前提下）：
+
+| 操作 | 期望 |
+|---|---|
+| 在 MASTER 停 `core-nrf`（critical） | 约 10s verdict `ready=0`、`critical_down_names=nrf`；keepalived 连续 3 次 gate=1 后释放 VIP，约 25~30s 完成；交换机上 `ready=1` |
+| 在 BACKUP 停一个 critical NF | BACKUP 的 `check` 仍 exit 0，keepalived 保持 BACKUP；不会主动抢 VIP |
+| 停 `core-udm`（important） | `ready` 仍为 1，不切换；verdict `important_down=1`，告警 `nf_important_down` |
+| 两台同时停 critical NF | MASTER gate 返回 0（对端也未就绪），VIP 不漂移，告警 `core_peer_block` |
+| kill coremgr 或 verdict 变旧 | MASTER gate 返回 0，不切换；告警 `core_stale` |
+| `enforce: false` 下停 critical NF | 不切换；`/coremgr/ha/status` 出现告警 |
 
 ### 9.4 仓库自带测试套件
 
@@ -778,6 +908,19 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 17 | MySQL 首次初始化 | 本机磁盘上 InnoDB + 时区数据初始化约 5 分钟 | 部署等待超时 | ✅ 2026-11-09：`deploy_cluster.sh` 等待 600s，并让两台 MySQL 并行初始化 |
 | 18 | `restore_mysql_slave.sh` | 用 `mysqladmin ping` 判断就绪，初始化阶段的临时实例会误报 | 导入过早失败 | ✅ 2026-11-09：改为 TCP + 密码 `SELECT 1`，最多等 300s |
 
+### 10.1 核心网健康与多 VIP 排障
+
+| 现象 | 排查 | 处理 |
+|---|---|---|
+| verdict 里某个 NF 一直是 `down`，但容器在运行 | `curl -v <该 NF 完整 URL>`；对照 `nf_health.nfs[].url` | 多半是路径写错（NRF 是 `/health_check`，其他常见 `/health`），改配置后重启 coremgr |
+| verdict 不更新 / `updated` 很旧 | `systemctl status coremgr`；`ls -l /var/run/coremgr_nf_health`；coremgr 日志搜 `nf_health` | coremgr 未运行、`/var/run` 不可写（需 root）、或 `nf_health.enable=false` |
+| 对端 `curl :8888/coremgr/ha/health` 失败 | 对端 coremgr 是否运行、`ss -lntp \| grep 8888`、两台防火墙 | 旧版 coremgr 没有该路由，先升级两端；端点不可达时 MySQL 故障仍按原逻辑切换 |
+| NF 反复重启 | verdict `nf_<name>=restarting`；coremgr 日志 `restart`；看该 NF 容器日志 | 先修 NF 本身；临时置 `restart_enable: false` 止损；`restart_cooldown/window/max` 控制频率 |
+| 滚动升级期间发生误切换 | `check-core status` 的 `critical_down_names` | 升级前置 `enforce: false`，升级完成并确认 `ready=1` 后恢复 |
+| 只漂了部分 VIP | `ip -o -4 addr show ens3`；`cat /etc/keepalived/replica-vips`；`/coremgr/ha/status` 的 `vip_incomplete` 告警 | 两台的 `replica-vips` 必须一致；改完后 `keepalived -t` 并重启；不要在运行中手工 `ip addr add` |
+| 想临时退回“只按 MySQL 切换” | — | `nf_health.enforce: false` + 重启 coremgr，无需回退二进制或 keepalived 配置 |
+| 查看判定过程 | `sudo /etc/keepalived/replica-runner.sh check-core status`；`tail -f logs/keepalived-wrapper.log` | 告警 key：`core_critical`、`core_peer_block`、`core_stale`、`core_missing`，默认 300s 限频 |
+
 ---
 
 ## 11. 日常运维命令
@@ -803,9 +946,16 @@ docker exec -i redis redis-cli -a 'A8K5h7+6!?' info replication | head -20
 docker exec etcd etcdctl --endpoints=http://10.18.1.27:2379,http://10.18.1.28:2379,http://10.18.1.30:23790 endpoint status -w table
 
 # VIP / keepalived
-ip -o -4 addr show ens3 | grep 10.18.1.30
+ip -o -4 addr show ens3 | grep -E '10\.18\.1\.(30|31)'
+cat /etc/keepalived/replica-vips
 sudo systemctl status keepalived
 sudo journalctl -u keepalived -f
+
+# 核心网健康与 HA 状态
+sudo /etc/keepalived/replica-runner.sh check-core status
+cat /var/run/coremgr_nf_health
+curl -fsS http://127.0.0.1:8888/coremgr/ha/status
+curl -fsS http://10.18.1.28:8888/coremgr/ha/health   # 对端
 
 # 业务切换日志
 tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
@@ -822,7 +972,8 @@ tail -f /home/sder/ha/replica/logs/etcd-keepalived.log
 |---|---|
 | 部署日期 | |
 | 部署人 | |
-| 节点 1 / 节点 2 / VIP | 10.18.1.27 / 10.18.1.28 / 10.18.1.30 |
+| 节点 1 / 节点 2 / VIP 组 | 10.18.1.27 / 10.18.1.28 / 10.18.1.30（可多个，第一个为数据面） |
+| NF 级别 / enforce / restart | 默认 nrf+smf critical，其余 important；enforce=false 观察，确认后开 true |
 | 初始主库 | |
 | 数据是否保留 | 是 / 否 |
 | 端口冲突处理 | |

@@ -96,6 +96,9 @@
 2. MySQL 正常后查 `check_core_status.sh gate`：`enforce=0`、verdict 过期或本地只是 grace → 不切换；critical NF 确认故障且**对端 ready=1** → exit 1。
 3. 对端也异常 → 保持现状并告警，避免把 VIP 交给一个同样不可用的节点。
 
+页面“自动倒换”开关打开后，主用节点还会按 coremgr 自身探测结果主动倒换（见 7.5），不依赖 keepalived 的
+`track_script`；两条路径互斥执行：keepalived 先动作时 coremgr 看到主用已变化就不再介入。
+
 ### 1.4 容灾指标
 
 - VIP 漂移：keepalived 层面约 3~4 秒（`advert_int 1`，丢 3 个通告）。
@@ -777,6 +780,51 @@ MySQL 硬故障路径额外做对端检查：`CORE_PEER_GATE_MYSQL=1`（默认�
 - 调整阈值：`interval`、`fail_threshold`、`grace`、`stale_after`；`stale_after` 必须大于 `interval`。
 - 升级 NF 前先置 `enforce: false` 可以避免滚动升级期间判为故障；升级完恢复。
 
+### 7.5 自动倒换开关与 upfcp 通知
+
+OMC 主备容灾页面标题栏有一个“自动倒换”开关，默认关闭。它是 coremgr 的运行时开关，
+与 7.4 的 `enforce`（keepalived 自身的切换门槛）**相互独立**：
+
+- 打开后，**主用节点**每 `auto_check_sec`（默认 5s）检查一次本机探测结果；
+- 判定为“探测异常”的条件（任一）：
+  - 核心网 `enabled` 且 `ready=0` 且 `critical_down>0`（关键网元已确认故障，不是 grace/未知）；
+  - MySQL 容器运行但未就绪；
+  - MySQL 已提升但 `read_only=1`。
+- 需要连续 `auto_fail_threshold`（默认 3）次确认，且**备用节点状态为 `backup_running`**
+  （MySQL 复制正常、核心网就绪）才执行倒换；对端未就绪时只显示“暂不倒换”原因，不动 VIP。
+- 执行后进入 `auto_cooldown_sec`（默认 600s）冷却，避免故障未恢复时反复切换。
+- 开关状态保存在 `/usr/local/coremgr/config/ha_auto.json`（重启/升级不丢失），并自动同步到对端节点，
+  倒换后新主用仍然生效。
+
+接口（页面经 omc-backend 代理到本机 coremgr）：
+
+```bash
+# 查看
+curl -sS http://127.0.0.1:8888/coremgr/ha/auto-switch
+# 打开/关闭
+curl -sS -X POST http://127.0.0.1:8888/coremgr/ha/auto-switch \
+  -H 'Content-Type: application/json' -d '{"enabled":true,"operator":"admin"}'
+```
+
+`/coremgr/ha/status` 的 `auto_switch` 字段同时返回 `enabled/armed/pending_reason/last_switch_at`，
+`pending_reason` 会说明“为什么打开了还没切”（例如备用节点未就绪、冷却中）。
+
+**upfcp 通知**：每次执行倒换（手动或自动）时，执行节点在释放 VIP 前向 upfcp 发送
+`POST {"isMaster":false}`，表示本机已降为备用：
+
+```yaml
+ha:
+  upfcp_notify: true
+  upfcp_notify_url: "http://192.0.2.10:56666/api/v1/ha/switch"
+  upfcp_timeout_ms: 3000
+```
+
+- 地址按节点实际监听地址修改；`upfcp_notify: false` 或 URL 留空可关闭。
+- 通知是异步的，超时/失败只记 coremgr 日志，不阻塞也不回滚倒换。
+- 日志关键字：`已通知 upfcp 本机降为备用` / `倒换通知 upfcp 失败`。
+
+关闭自动倒换：页面开关关掉即可（立即生效，无需重启）；也可回退配置后重启 coremgr。
+
 ---
 
 ## 8. 端到端验收清单
@@ -803,6 +851,9 @@ MySQL 硬故障路径额外做对端检查：`CORE_PEER_GATE_MYSQL=1`（默认�
 | 18 | 对端 health 可达 | `curl -fsS --max-time 2 http://10.18.1.28:8888/coremgr/ha/health` | 返回 key=value，`node` 为 .28 |
 | 19 | 核心网结论 | `sudo /etc/keepalived/replica-runner.sh check-core status` | 全部 NF healthy，`ready=1`；MASTER 侧 gate=0 |
 | 20 | NF 探活路径 | 对每个配置 URL 执行 `curl -sS -o /dev/null -w '%{http_code}'` | 200/2xx（NRF 用 `/health_check`） |
+| 21 | 自动倒换开关 | `curl -sS http://127.0.0.1:8888/coremgr/ha/auto-switch` | `enabled` 与页面一致；两台同步 |
+| 22 | 自动倒换演练 | 见 9.3“自动倒换”行 | 打开开关后停 critical NF，约 15~20s 自动倒换 |
+| 23 | upfcp 通知 | 执行任意倒换，在 upfcp 侧抓包/看日志 | 收到 `POST /api/v1/ha/switch {"isMaster":false}` |
 
 ---
 
@@ -856,6 +907,16 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" | grep
 | 两台同时停 critical NF | MASTER gate 返回 0（对端也未就绪），VIP 不漂移，告警 `core_peer_block` |
 | kill coremgr 或 verdict 变旧 | MASTER gate 返回 0，不切换；告警 `core_stale` |
 | `enforce: false` 下停 critical NF | 不切换；`/coremgr/ha/status` 出现告警 |
+
+自动倒换（页面开关打开、`nf_health.nfs` 已配置）：
+
+| 操作 | 期望 |
+|---|---|
+| MASTER 停 `core-nrf`（critical） | 连续 `auto_fail_threshold`×`auto_check_sec` 后 coremgr 主动执行倒换；历史记录 `kind=auto`，原因“核心网关键网元异常（nrf）” |
+| 备用节点未就绪时停 critical NF | 不切换；页面显示 `pending_reason`“备用节点未就绪…”，VIP 不动 |
+| 关闭开关后停 critical NF | 不自动倒换（keepalived 行为仍由 `enforce` 决定） |
+| 倒换执行时观察 upfcp | 收到 `{"isMaster":false}`；coremgr 日志有“已通知 upfcp 本机降为备用” |
+| 开关同步 | 在 .27 打开后，`curl http://10.18.1.28:8888/coremgr/ha/auto-switch` 同为 `enabled=true` |
 
 ### 9.4 仓库自带测试套件
 
@@ -920,6 +981,10 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 只漂了部分 VIP | `ip -o -4 addr show ens3`；`cat /etc/keepalived/replica-vips`；`/coremgr/ha/status` 的 `vip_incomplete` 告警 | 两台的 `replica-vips` 必须一致；改完后 `keepalived -t` 并重启；不要在运行中手工 `ip addr add` |
 | 想临时退回“只按 MySQL 切换” | — | `nf_health.enforce: false` + 重启 coremgr，无需回退二进制或 keepalived 配置 |
 | 查看判定过程 | `sudo /etc/keepalived/replica-runner.sh check-core status`；`tail -f logs/keepalived-wrapper.log` | 告警 key：`core_critical`、`core_peer_block`、`core_stale`、`core_missing`，默认 300s 限频 |
+| 自动倒换开关打开了但不切换 | `curl http://127.0.0.1:8888/coremgr/ha/auto-switch` 看 `pending_reason`；看 `armed` 与主用节点 | `armed=false` 表示本节点不是主用；`pending_reason` 会说明“备用未就绪/冷却中/连续确认中”；备用必须 `backup_running` |
+| 开关只在一台生效 | 两台分别 `curl :8888/coremgr/ha/auto-switch` | 对端不可达时同步失败只记日志；恢复网络后在页面再切一次，或直接调对端接口 |
+| upfcp 没收到通知 | `grep 'upfcp' coremgr 日志`；`curl -v <upfcp_notify_url>` | 检查 URL/端口与 upfcp 监听地址；`upfcp_notify: false` 或 URL 为空会跳过；失败不影响倒换 |
+| 自动倒换后原故障未恢复 | `pending_reason`、`last_error`；检查故障 NF/MySQL | 冷却期内不会再次切换；先恢复故障，必要时人工回切 |
 
 ---
 

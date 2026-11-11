@@ -54,6 +54,15 @@ RESTORE_TS_FILE="/var/run/replica_restore_last"
 # 自动重建最小间隔（秒）。只约束健康检查的自动调度，手动执行 restore 不受影响。
 # 复制真损坏时避免每 5 秒反复拉起重建；需要连续压测可临时置 0。
 RESTORE_INTERVAL=120
+# 从库重建方式：
+#   clone（默认）= MySQL clone 插件物理克隆，秒级完成，不产生新 server_uuid/
+#                  初始化事务，重建后的第一次倒换不再等待大事务；失败自动回退 dump。
+#   dump         = mysqldump 逻辑导出（跨版本/跨环境可用）。
+# 可用环境变量覆盖：RESTORE_MODE=dump ./restore_mysql_slave.sh
+RESTORE_MODE="${RESTORE_MODE:-clone}"
+# donor 侧克隆账号（BACKUP_ADMIN）；restore 脚本每次会自动创建/修正，无需手工维护。
+CLONE_USER="cloneuser"
+CLONE_PASS="Clone#R3pl1ca"
 # 手动/自动重建互斥锁；restore_mysql_slave.sh 持锁，健康检查据此避免重复拉起
 RESTORE_LOCK_FILE="/var/run/replica_restore.lock"
 # BACKUP 复制异常的轻量修复状态：先重指 VIP 重启复制，连续失败才全量重建

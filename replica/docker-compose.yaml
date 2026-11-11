@@ -10,7 +10,9 @@ services:
       - --server-id=27 # 唯一的服务器ID，主库为1，从库为2及以上
       - --log-bin=mysql-bin
       - --binlog-format=ROW
-      - --expire-logs-days=7
+      # binlog 保留 7 天（604800s）。不能用已弃用的 --expire-logs-days：
+      # 两个变量互斥，同时出现会启动失败/参数不生效。
+      - --binlog-expire-logs-seconds=604800
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --log-slave-updates=ON
@@ -18,6 +20,9 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --bind-address=0.0.0.0
+      # 启动即加载 clone 插件：备库平时 super_read_only=ON，运行时 INSTALL PLUGIN
+      # 会被拒绝（1290），预加载可避免 clone 重建依赖运行时装插件。
+      - --plugin-load-add=mysql_clone.so
     volumes:
       - ./data/mysql:/var/lib/mysql
     # ports:

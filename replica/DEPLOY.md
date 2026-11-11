@@ -121,6 +121,18 @@ BACKUP 侧发现复制为空或 IO/SQL 异常时，`check_mysql_status.sh` 只�
 | 手动/自动互斥 | `/var/run/replica_restore.lock` | restore 持锁，健康检查拉起前探测。不会出现两个重建同时清库（曾导致 GTID_PURGED 3546 / super-read-only 1290） |
 | 日志是否限频 | `base.sh` `LOG_UNLIMITED=1` | 1 = 所有检查结果都落日志；告警邮件仍由 `notify_limited` 限频 |
 | 重建标记 | `.restoring`（内容为 PID） | 重建期间健康检查不强制只读、不干预复制；进程异常退出后按 PID 存活 + 新鲜度判定，不会残留一小时 |
+| 重建方式 | `base.sh` `RESTORE_MODE=clone` | clone 优先（物理克隆，秒级）；失败自动回退 mysqldump。`RESTORE_MODE=dump` 可强制走逻辑导出 |
+
+**物理克隆（RESTORE_MODE=clone，默认）说明**
+
+- 流程：主库执行 `CLONE LOCAL DATA DIRECTORY`（本地克隆，不重启、不阻塞 DML）→ 通过 ssh 把克隆目录 tar 流式传到备库 datadir → `docker start mysql` → 配置复制。实测总耗时约 **38s**（mysqldump 约 160s）。
+- 克隆产物来自主库现有 datadir，**不会重新初始化数据库**，因此不会产生新的初始化事务（那是重建后第一次倒换要等 ~74s 的原因）；本次实测重建后备库 GTID 集合与主库完全一致，倒换提升耗时 **4s**（此前约 74s）。
+- 克隆目录不含 `auto.cnf`，备库启动时会生成自己的 `server_uuid`；但 `gtid_executed` 来自主库快照，新 UUID 下没有任何事务，不影响复制和倒换。
+- 主库侧插件和账号由脚本自动准备（`INSTALL PLUGIN clone`、`cloneuser` + `BACKUP_ADMIN`）；compose 已加 `--plugin-load-add=mysql_clone.so`，容器启动即加载。
+- 克隆目录不含 `performance_schema/`，而预加载的 clone 插件初始化时要在该目录下建自己的 PFS 表；脚本会在启动前补建该目录（否则插件加载失败，仅告警不影响 MySQL 启动）。
+- 不使用远程 `CLONE INSTANCE`：容器内 mysqld 是 PID 1、无 systemd/mysqld_safe 监管，克隆收尾的“自行重启”会报 `ERROR 3707 (Restart server failed)`，所以改为本地克隆 + 传输。
+- 校验：克隆状态必须为 `Completed`，启动后检查业务表数量并确认 `GTID_SUBSET(主库克隆前集合, 备库 gtid_executed)`；任何一步失败都会自动回退 mysqldump 重建。
+- 手工强制逻辑重建：`sudo RESTORE_MODE=dump /home/sder/ha/replica/scripts/restore_mysql_slave.sh`。
 
 ---
 

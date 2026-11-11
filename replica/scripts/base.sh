@@ -43,10 +43,22 @@ MYSQL_PORT=3306
 REDIS_PASS="A8K5h7+6!?"
 REDIS_PORT=6379
 
+# ---- 日志 ----
+# 1 = 不限频：所有检查结果都落日志（排障期默认打开，重启后依然生效）。
+# 告警邮件仍由 notify_limited 限频，不受此开关影响。
+LOG_UNLIMITED=1
+
 # ---- 运行时文件 ----
 LOCK_FILE="/var/run/replica_health_check.lock"
 RESTORE_TS_FILE="/var/run/replica_restore_last"
-RESTORE_INTERVAL=600    # 从库重建最小间隔（秒）
+# 自动重建最小间隔（秒）。只约束健康检查的自动调度，手动执行 restore 不受影响。
+# 复制真损坏时避免每 5 秒反复拉起重建；需要连续压测可临时置 0。
+RESTORE_INTERVAL=120
+# 手动/自动重建互斥锁；restore_mysql_slave.sh 持锁，健康检查据此避免重复拉起
+RESTORE_LOCK_FILE="/var/run/replica_restore.lock"
+# BACKUP 复制异常的轻量修复状态：先重指 VIP 重启复制，连续失败才全量重建
+REPAIR_CNT_FILE="/var/run/replica_repair_count"
+REPAIR_TS_FILE="/var/run/replica_repair_last"
 PROMOTE_FLAG="/var/run/replica_promoting"   # 提升进行中标记，避免健康检查误判
 DEMOTE_FLAG="/var/run/replica_demoting"     # 降级进行中标记，避免健康检查误触发从库重建
 

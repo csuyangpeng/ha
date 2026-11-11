@@ -5,15 +5,11 @@ set -euo pipefail
 
 source "/home/sder/ha/replica/scripts/base.sh"
 
-# 重建期间通知健康检查不要强制只读：导入需要用 root 写库。
-# （备库正常状态下是 super_read_only=ON，root 也写不进去）
-RESTORE_FLAG="${REPLICA_DIR}/.restoring"
-echo $$ > "$RESTORE_FLAG"
-trap 'rm -f "$RESTORE_FLAG"' EXIT
-
 MASTER_IP="$MYSQL_VIP"
-BACKUP_FILE="/tmp/master_dump.sql"
-LOCAL_FILE="/tmp/master_dump_local.sql"
+# 每次运行用独立临时文件：/tmp 带 sticky 位（fs.protected_regular），
+# 上一次以 root 运行残留的固定文件名会让本次以 sder 运行 scp 时报 Permission denied。
+BACKUP_FILE="/tmp/master_dump.$$.sql"          # 对端（主库）上的 dump
+LOCAL_FILE="/tmp/master_dump_local.$$.sql"     # 本机上的副本
 
 # VIP 会在两台节点间漂移，SSH 主机密钥也随之变化；这里不校验 known_hosts，
 # 否则每次切换后自动重建都会因 "Host key verification failed" 失败。
@@ -21,6 +17,46 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
           -o BatchMode=yes -o ConnectTimeout=5)
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# 预检：确认当前用户能清理 data/mysql。健康检查/keepalived 以 root 运行；
+# 以 sder 手工执行时必须先 chown（deploy_cluster.sh 的 fallback_restore 会做），
+# 否则会在 docker stop 之后才因权限失败，留下半清空的 datadir。
+preflight() {
+    local bad
+    [ -d "${REPLICA_DIR}/data/mysql" ] || return 0
+    # 只看目录：rm -rf 能否删除取决于目录是否可写，与文件自身权限无关。
+    # 不能看文件：mysql.sock 是指向容器内 /var/run/mysqld 的悬空软链接，
+    # `[ -w ]` 对悬空链接恒为假，会把 root 也误判成无权限。
+    bad=$(find "${REPLICA_DIR}/data/mysql" -maxdepth 4 -type d ! -writable -print -quit 2>/dev/null) || true
+    [ -z "$bad" ] && return 0
+    log "[RESTORE] 无权限清理 ${bad}，请以 root 运行，或先 sudo chown -R $(id -un) ${bad}"
+    return 1
+}
+preflight || exit 1
+
+# 手动与自动重建共用一把全局锁：健康检查在拉起前也会探测同一把锁。
+# 拿不到锁说明已有重建在进行，直接退出，避免两个进程同时清空 data/mysql
+# 并并发导入（会撞出 GTID_PURGED 3546 / super-read-only 1290）。
+# 用 -w 2 而不是 -n：健康检查的探测会瞬时持锁，短暂等待可避免误判为"已有重建"。
+[ -e "$RESTORE_LOCK_FILE" ] || : > "$RESTORE_LOCK_FILE" 2>/dev/null || true
+chmod 666 "$RESTORE_LOCK_FILE" 2>/dev/null || true
+exec 8>"$RESTORE_LOCK_FILE" || { log "[RESTORE] 无法打开重建锁 ${RESTORE_LOCK_FILE}"; exit 1; }
+if ! flock -w 2 8; then
+    log "[RESTORE] 已有重建正在进行，本次退出"
+    exit 0
+fi
+
+# 拿到锁之后再写标记：避免并发时互相覆盖/删除 .restoring
+# （重建期间通知健康检查不要强制只读：导入需要用 root 写库）
+RESTORE_FLAG="${REPLICA_DIR}/.restoring"
+echo $$ > "$RESTORE_FLAG"
+
+# 无论成功、失败还是被中断，都清掉本机副本、标记和对端 dump，避免 /tmp 残留
+cleanup() {
+    rm -f "$RESTORE_FLAG" "$LOCAL_FILE"
+    ssh "${SSH_OPTS[@]}" "sder@${MASTER_IP}" "rm -f ${BACKUP_FILE}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 if is_on_vip; then
     log "[RESTORE] 本机持有 VIP，拒绝重建（应在 BACKUP 节点执行）"
@@ -40,6 +76,12 @@ log "2. 复制备份文件到本机"
 scp -q "${SSH_OPTS[@]}" "sder@${MASTER_IP}:${BACKUP_FILE}" "$LOCAL_FILE" >> "$LOG" 2>&1
 if [ ! -s "$LOCAL_FILE" ]; then
     log "[RESTORE] 备份文件为空，终止（未修改本地数据）"
+    exit 1
+fi
+# mysqldump 正常结束时会在末尾写 "-- Dump completed"；缺失说明传输/导出被截断，
+# 此时绝不能清空本地数据目录。
+if ! tail -n 3 "$LOCAL_FILE" | grep -q -- "Dump completed"; then
+    log "[RESTORE] 备份文件不完整（缺少 Dump completed 结束标记），终止（未修改本地数据）"
     exit 1
 fi
 log "   备份大小: $(du -h "$LOCAL_FILE" | awk '{print $1}')"
@@ -101,8 +143,7 @@ for _ in $(seq 1 30); do
 done
 echo "$STATUS" >> "$LOG"
 
-rm -f "$BACKUP_FILE" 2>/dev/null || true
-ssh "${SSH_OPTS[@]}" "sder@${MASTER_IP}" "rm -f ${BACKUP_FILE}" >> "$LOG" 2>&1 || true
+# 临时文件（本机副本、对端 dump、.restoring）由 cleanup() trap 统一清理
 
 if [ "$IO_RUNNING" = "Yes" ] && [ "$SQL_RUNNING" = "Yes" ]; then
     log "=== 重建完成：复制正常 ==="

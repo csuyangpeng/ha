@@ -16,6 +16,10 @@ source "/home/sder/ha/replica/scripts/base.sh"
 if ! declare -F log_limited >/dev/null; then
     log_limited() {
         local key=$1 interval=$2 msg=$3 f="/var/run/replica_log_${1}" now last
+        if [ "${LOG_UNLIMITED:-0}" = "1" ] || [ -e /var/run/replica_log_unlimited ]; then
+            echo "[$(date '+%F %T')] $msg" >> "$LOG"
+            return
+        fi
         now=$(date +%s)
         last=$(cat "$f" 2>/dev/null || echo 0)
         if [ $((now - last)) -ge "$interval" ]; then

@@ -86,7 +86,7 @@
 | 状态 | 触发脚本 | 动作 |
 |---|---|---|
 | 成为 MASTER | `notify_master.sh` | MySQL：`STOP SLAVE` → `RESET SLAVE ALL` → `read_only=OFF` → `FLUSH BINARY LOGS`；Redis：`SLAVEOF NO ONE`；etcd：启动 etcdvip 容器 |
-| 成为 BACKUP | `notify_slave.sh` | MySQL：`read_only=ON` → `RESET MASTER` → `CHANGE MASTER TO VIP` → `START SLAVE`；Redis：`SLAVEOF VIP 6379`；etcd：停止 etcdvip，重启 etcd |
+| 成为 BACKUP | `notify_slave.sh` | MySQL：`read_only=ON` → `STOP SLAVE` → `RESET SLAVE ALL` → `CHANGE MASTER TO VIP` → `START SLAVE`（不动 binlog）；Redis：`SLAVEOF VIP 6379`；etcd：停止 etcdvip，重启 etcd |
 | FAULT / STOP | `replica-runner.sh fault` | 按 BACKUP 处理：释放 VIP，MySQL/Redis 回到从库角色 |
 | 健康判定 | `check_mysql_status.sh` | MASTER：MySQL 可用/可写 → **核心网聚合 verdict 就绪** → 通过；BACKUP：始终 exit 0 |
 
@@ -96,7 +96,7 @@
 2. MySQL 正常后查 `check_core_status.sh gate`：`enforce=0`、verdict 过期或本地只是 grace → 不切换；critical NF 确认故障且**对端 ready=1** → exit 1。
 3. 对端也异常 → 保持现状并告警，避免把 VIP 交给一个同样不可用的节点。
 
-页面“自动倒换”开关打开后，主用节点还会按 coremgr 自身探测结果主动倒换（见 7.5），不依赖 keepalived 的
+页面“探测倒换”开关打开后，主用节点还会按 coremgr 自身探测结果主动倒换（见 7.5），不依赖 keepalived 的
 `track_script`；两条路径互斥执行：keepalived 先动作时 coremgr 看到主用已变化就不再介入。
 
 ### 1.4 容灾指标
@@ -106,6 +106,21 @@
 - 多 VIP 整组同漂，不提供单 VIP 独立漂移。
 - MySQL / Redis 都是异步复制：**RPO > 0**，主库宕机前未复制的事务会丢。
 - 切换后客户端必须重连并重试；应用侧建议配连接重试与只读判断。
+
+### 1.5 从库复制异常：先轻量修复，再全量重建
+
+BACKUP 侧发现复制为空或 IO/SQL 异常时，`check_mysql_status.sh` 只告警、不释放 VIP，并按以下顺序处理：
+
+1. `Last_IO_Error` / `Last_SQL_Error` 属于数据级错误（GTID/relay log 缺失、1236/1837、重复键 1032/1062、库表不存在等）→ 直接调度全量重建；
+2. 其他情况先做轻量修复：`STOP SLAVE` → `CHANGE MASTER TO MASTER_HOST=<VIP>` → `START SLAVE`，每 15s 最多一次；
+3. 连续 3 次轻量修复仍失败才调度全量重建。常见场景（MySQL 重启后复制配置丢失、指向错误）几秒即可恢复，不必清库。
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 自动重建最小间隔 | `base.sh` `RESTORE_INTERVAL=120` | 只限制健康检查的自动调度；手工执行 restore 不受影响。压测时可临时置 0 |
+| 手动/自动互斥 | `/var/run/replica_restore.lock` | restore 持锁，健康检查拉起前探测。不会出现两个重建同时清库（曾导致 GTID_PURGED 3546 / super-read-only 1290） |
+| 日志是否限频 | `base.sh` `LOG_UNLIMITED=1` | 1 = 所有检查结果都落日志；告警邮件仍由 `notify_limited` 限频 |
+| 重建标记 | `.restoring`（内容为 PID） | 重建期间健康检查不强制只读、不干预复制；进程异常退出后按 PID 存活 + 新鲜度判定，不会残留一小时 |
 
 ---
 
@@ -553,7 +568,13 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' < /tmp/master_dump.sql
 # 3) 按 5.3 重新配置复制
 ```
 
-仓库的 `scripts/restore_mysql_slave.sh` 做的就是这个流程，但它把主从 IP 写死成 .28/.27、会 `rm -rf data/mysql/*`、且依赖 ssh 免密，只适合"确认当前主库是 .28"的场景，使用前必须改。
+仓库的 `scripts/restore_mysql_slave.sh` 做的就是这个流程，已按以下方式加固，可直接使用：
+
+- 复制源统一用 VIP（`$MYSQL_VIP`），不写死节点；
+- 先做数据目录可写预检（以 sder 手工执行需先 `chown`，`deploy_cluster.sh` 的 `fallback_restore` 会自动处理），避免在 `docker stop` 之后才因权限失败、留下半清空的 datadir；
+- dump 必须包含 mysqldump 的 `-- Dump completed` 结束标记才允许清库；
+- 临时文件按 PID 命名（`/tmp/master_dump.$$.sql`），退出时统一清理本机副本、对端 dump 和 `.restoring`；
+- 与健康检查的自动重建共用 flock，不会并发清库；本机持有 VIP 时拒绝执行。
 
 ### 5.5 复制延迟与参数
 
@@ -754,6 +775,9 @@ keepalived **不直接探活 NF**，只看一个结论；这样探活逻辑、�
 - 级别：`critical`（默认 `nrf`、`smf`）故障会导致 `ready=0`，参与倒换；`important`（其余）故障只告警，
   不阻塞 `ready`。
 - coremgr 只探测和上报，**不会重启或操作 NF**；NF 的恢复由 core 自身/运维负责。
+- 页面展示分层：主备容灾状态（主运行/备运行/异常）只反映 keepalived、VIP、MySQL 复制等容灾链路，
+  **不因 NF 探测结果改变**；NF 探测结果单独显示为“业务状态”（正常/降级/异常/探测中/未启用），
+  关键网元、重要网元的异常明细在“业务状态”卡片中列出，不再混入容灾告警。
 - `enforce: false` 时 verdict 照常生成，但不参与切换（观察模式）；确认探活 URL 全部正确后再打开。
 - 探活 URL 必须写真实路径：NRF 是 `/health_check`，不是 `/health`。用
   `curl -sS -o /dev/null -w '%{http_code}\n' <url>` 逐条确认后再打开 enforce。
@@ -780,9 +804,9 @@ MySQL 硬故障路径额外做对端检查：`CORE_PEER_GATE_MYSQL=1`（默认�
 - 调整阈值：`interval`、`fail_threshold`、`grace`、`stale_after`；`stale_after` 必须大于 `interval`。
 - 升级 NF 前先置 `enforce: false` 可以避免滚动升级期间判为故障；升级完恢复。
 
-### 7.5 自动倒换开关与 upfcp 通知
+### 7.5 探测倒换开关与 upfcp 通知
 
-OMC 主备容灾页面标题栏有一个“自动倒换”开关，默认关闭。它是 coremgr 的运行时开关，
+OMC 主备容灾页面标题栏有一个“探测倒换”开关，默认关闭。它是 coremgr 的运行时开关，
 与 7.4 的 `enforce`（keepalived 自身的切换门槛）**相互独立**：
 
 - 打开后，**主用节点**每 `auto_check_sec`（默认 5s）检查一次本机探测结果；
@@ -823,7 +847,7 @@ ha:
 - 通知是异步的，超时/失败只记 coremgr 日志，不阻塞也不回滚倒换。
 - 日志关键字：`已通知 upfcp 本机降为备用` / `倒换通知 upfcp 失败`。
 
-关闭自动倒换：页面开关关掉即可（立即生效，无需重启）；也可回退配置后重启 coremgr。
+关闭探测倒换：页面开关关掉即可（立即生效，无需重启）；也可回退配置后重启 coremgr。
 
 ---
 
@@ -851,8 +875,8 @@ ha:
 | 18 | 对端 health 可达 | `curl -fsS --max-time 2 http://10.18.1.28:8888/coremgr/ha/health` | 返回 key=value，`node` 为 .28 |
 | 19 | 核心网结论 | `sudo /etc/keepalived/replica-runner.sh check-core status` | 全部 NF healthy，`ready=1`；MASTER 侧 gate=0 |
 | 20 | NF 探活路径 | 对每个配置 URL 执行 `curl -sS -o /dev/null -w '%{http_code}'` | 200/2xx（NRF 用 `/health_check`） |
-| 21 | 自动倒换开关 | `curl -sS http://127.0.0.1:8888/coremgr/ha/auto-switch` | `enabled` 与页面一致；两台同步 |
-| 22 | 自动倒换演练 | 见 9.3“自动倒换”行 | 打开开关后停 critical NF，约 15~20s 自动倒换 |
+| 21 | 探测倒换开关 | `curl -sS http://127.0.0.1:8888/coremgr/ha/auto-switch` | `enabled` 与页面一致；两台同步 |
+| 22 | 探测倒换演练 | 见 9.3“探测倒换”行 | 打开开关后停 critical NF，约 15~20s 自动倒换 |
 | 23 | upfcp 通知 | 执行任意倒换，在 upfcp 侧抓包/看日志 | 收到 `POST /api/v1/ha/switch {"isMaster":false}` |
 
 ---
@@ -908,7 +932,7 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SHOW SLAVE STATUS\G" | grep
 | kill coremgr 或 verdict 变旧 | MASTER gate 返回 0，不切换；告警 `core_stale` |
 | `enforce: false` 下停 critical NF | 不切换；`/coremgr/ha/status` 出现告警 |
 
-自动倒换（页面开关打开、`nf_health.nfs` 已配置）：
+探测倒换（页面“探测倒换”开关打开、`nf_health.nfs` 已配置）：
 
 | 操作 | 期望 |
 |---|---|
@@ -981,7 +1005,7 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | 只漂了部分 VIP | `ip -o -4 addr show ens3`；`cat /etc/keepalived/replica-vips`；`/coremgr/ha/status` 的 `vip_incomplete` 告警 | 两台的 `replica-vips` 必须一致；改完后 `keepalived -t` 并重启；不要在运行中手工 `ip addr add` |
 | 想临时退回“只按 MySQL 切换” | — | `nf_health.enforce: false` + 重启 coremgr，无需回退二进制或 keepalived 配置 |
 | 查看判定过程 | `sudo /etc/keepalived/replica-runner.sh check-core status`；`tail -f logs/keepalived-wrapper.log` | 告警 key：`core_critical`、`core_peer_block`、`core_stale`、`core_missing`，默认 300s 限频 |
-| 自动倒换开关打开了但不切换 | `curl http://127.0.0.1:8888/coremgr/ha/auto-switch` 看 `pending_reason`；看 `armed` 与主用节点 | `armed=false` 表示本节点不是主用；`pending_reason` 会说明“备用未就绪/冷却中/连续确认中”；备用必须 `backup_running` |
+| 探测倒换开关打开了但不切换 | `curl http://127.0.0.1:8888/coremgr/ha/auto-switch` 看 `pending_reason`；看 `armed` 与主用节点 | `armed=false` 表示本节点不是主用；`pending_reason` 会说明“备用未就绪/冷却中/连续确认中”；备用必须 `backup_running` |
 | 开关只在一台生效 | 两台分别 `curl :8888/coremgr/ha/auto-switch` | 对端不可达时同步失败只记日志；恢复网络后在页面再切一次，或直接调对端接口 |
 | upfcp 没收到通知 | `grep 'upfcp' coremgr 日志`；`curl -v <upfcp_notify_url>` | 检查 URL/端口与 upfcp 监听地址；`upfcp_notify: false` 或 URL 为空会跳过；失败不影响倒换 |
 | 自动倒换后原故障未恢复 | `pending_reason`、`last_error`；检查故障 NF/MySQL | 冷却期内不会再次切换；先恢复故障，必要时人工回切 |

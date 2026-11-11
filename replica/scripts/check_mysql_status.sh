@@ -14,8 +14,13 @@ log() {
 }
 
 # 限频日志：同一 key 每 interval 秒最多写一条
+# LOG_UNLIMITED=1（base.sh）或存在 /var/run/replica_log_unlimited 时不限频
 log_limited() {
     local key=$1 interval=$2 msg=$3 f now last
+    if [ "${LOG_UNLIMITED:-0}" = "1" ] || [ -e /var/run/replica_log_unlimited ]; then
+        log "$msg"
+        return
+    fi
     f="/var/run/replica_log_${key}"
     now=$(date +%s)
     last=$(cat "$f" 2>/dev/null || echo 0)
@@ -67,6 +72,12 @@ in_demotion() {
 # 从库重建：异步执行 + 限频，避免拖住 keepalived 的健康检查
 schedule_restore() {
     local now last
+    # 已有重建在进行（手动或自动）就不再拉起第二个；
+    # 锁由 restore_mysql_slave.sh 持有，这里只探测不抢占。
+    if [ -e "$RESTORE_LOCK_FILE" ] && ! flock -n "$RESTORE_LOCK_FILE" true 2>/dev/null; then
+        log_limited restore_busy 300 "已有重建在进行，跳过本次调度"
+        return 0
+    fi
     now=$(date +%s)
     last=$(cat "$RESTORE_TS_FILE" 2>/dev/null || echo 0)
     if [ $((now - last)) -lt "$RESTORE_INTERVAL" ]; then
@@ -76,6 +87,63 @@ schedule_restore() {
     echo "$now" > "$RESTORE_TS_FILE"
     log "异步执行从库重建：$SCRIPT_DIR/restore_mysql_slave.sh"
     setsid "$SCRIPT_DIR/restore_mysql_slave.sh" >> "$LOG" 2>&1 < /dev/null &
+}
+
+# ---- BACKUP 复制异常的处置 ----
+# 顺序：数据级错误直接重建；其余先做轻量修复（重新指向 VIP + 启动复制），
+# 每 15s 最多一次，连续 3 次仍失败才允许全量重建。
+# 典型收益：MySQL 重启后复制配置丢失/指向错误，几秒就能恢复，不必清库重建。
+REPAIR_MAX_ATTEMPTS=3
+REPAIR_MIN_INTERVAL=15
+
+repair_replication() {
+    mysql_exec >/dev/null 2>&1 <<EOF
+STOP SLAVE;
+CHANGE MASTER TO
+  MASTER_HOST='${MYSQL_VIP}',
+  MASTER_USER='${MYSQL_USER}',
+  MASTER_PASSWORD='${MYSQL_PASS}',
+  MASTER_PORT=${MYSQL_PORT},
+  MASTER_AUTO_POSITION=1,
+  MASTER_CONNECT_RETRY=10;
+START SLAVE;
+EOF
+}
+
+is_data_level_error() {
+    printf '%s' "$1" | grep -qiE 'Error_code: ?(1032|1049|1062|1146|1236|1837)|purged|gtid|duplicate entry|unknown database|doesn.t exist'
+}
+
+handle_replication_problem() {   # $1=role $2=简述 $3=Last_IO/SQL_Error 文本
+    local role=$1 desc=$2 err=$3 now last cnt
+    if is_data_level_error "$err"; then
+        notify_limited repl_rebuild 300 "$role" "ERROR" "BACKUP 复制数据级损坏（${desc}），准备全量重建"
+        rm -f "$REPAIR_CNT_FILE" "$REPAIR_TS_FILE" 2>/dev/null || true
+        schedule_restore
+        return 0
+    fi
+
+    now=$(date +%s)
+    last=$(cat "$REPAIR_TS_FILE" 2>/dev/null || echo 0)
+    cnt=$(cat "$REPAIR_CNT_FILE" 2>/dev/null || echo 0)
+    case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+
+    if [ $((now - last)) -lt "$REPAIR_MIN_INTERVAL" ]; then
+        log_limited repair_wait 15 "BACKUP 复制异常（${desc}），等待轻量修复结果（${cnt}/${REPAIR_MAX_ATTEMPTS}）"
+        return 0
+    fi
+
+    notify_limited repl_repair 300 "$role" "WARNING" "BACKUP 复制异常（${desc}），先尝试轻量修复（重新指向 VIP）"
+    echo "$now" > "$REPAIR_TS_FILE" 2>/dev/null || true
+    cnt=$((cnt + 1))
+    echo "$cnt" > "$REPAIR_CNT_FILE" 2>/dev/null || true
+    repair_replication
+    log "BACKUP 复制异常（${desc}），已重新指向 VIP ${MYSQL_VIP} 并启动复制（${cnt}/${REPAIR_MAX_ATTEMPTS}）"
+    [ "$cnt" -lt "$REPAIR_MAX_ATTEMPTS" ] && return 0
+
+    notify_limited repl_rebuild 300 "$role" "ERROR" "BACKUP 复制异常（${desc}），轻量修复 ${cnt} 次无效，准备全量重建"
+    rm -f "$REPAIR_CNT_FILE" "$REPAIR_TS_FILE" 2>/dev/null || true
+    schedule_restore
 }
 
 # 依赖上面定义的日志/告警/提升判定函数，放在 main 之前 source
@@ -128,10 +196,17 @@ main() {
     # ---- BACKUP：确保只读（SET GLOBAL 不持久，重启后会变回可写） ----
     # 应用当前用 root 连接，read_only=ON 挡不住 SUPER，必须 super_read_only=ON。
     # 从库重建（restore_mysql_slave.sh）需要用 root 导入，期间靠标记文件跳过。
-    local restoring=0 ro sro flag_age
+    local restoring=0 ro sro flag_age flag_pid
     if [ -f "${REPLICA_DIR}/.restoring" ]; then
         flag_age=$(( $(date +%s) - $(stat -c %Y "${REPLICA_DIR}/.restoring" 2>/dev/null || echo 0) ))
-        [ "$flag_age" -lt 3600 ] && restoring=1
+        flag_pid=$(tr -dc '0-9' < "${REPLICA_DIR}/.restoring" 2>/dev/null)
+        if [ -n "$flag_pid" ] && kill -0 "$flag_pid" 2>/dev/null; then
+            # 标记里的 PID 还活着才算重建进行中（进程被 kill -9 时 trap 不会执行）
+            [ "$flag_age" -lt 7200 ] && restoring=1
+        else
+            # 旧格式（无 PID）或进程已退出：按新鲜度兜底
+            [ "$flag_age" -lt 3600 ] && restoring=1
+        fi
     fi
     if [ "$restoring" -eq 0 ]; then
         ro=$(mysql_query "SELECT @@global.read_only")
@@ -143,15 +218,19 @@ main() {
     fi
 
     # ---- BACKUP：只看复制健康，不返回失败 ----
-    local status io sql_r lag
+    local status io sql_r lag err
     status=$(mysql_exec -e "SHOW SLAVE STATUS\G" 2>/dev/null)
     if [ -z "$status" ]; then
         if in_demotion; then
             log_limited demoting 30 "BACKUP 降级进行中（尚未配置复制），跳过重建"
             exit 0
         fi
-        notify_limited no_slave 300 "$role" "WARNING" "BACKUP 未配置复制关系（${LOCAL_IP}），准备重建"
-        schedule_restore
+        if [ "$restoring" -eq 1 ]; then
+            log_limited restore_running 30 "从库重建进行中，跳过复制检查"
+            exit 0
+        fi
+        log "BACKUP 未配置复制关系（${LOCAL_IP}）"
+        handle_replication_problem "$role" "未配置复制关系" ""
         exit 0
     fi
 
@@ -164,11 +243,16 @@ main() {
             log_limited demoting 30 "BACKUP 降级进行中（IO=${io:-N/A}, SQL=${sql_r:-N/A}），跳过重建"
             exit 0
         fi
-        notify_limited repl_broken 300 "$role" "WARNING" "BACKUP 复制异常（IO=${io:-N/A}, SQL=${sql_r:-N/A}），准备重建"
-        schedule_restore
+        if [ "$restoring" -eq 1 ]; then
+            log_limited restore_running 30 "从库重建进行中，跳过复制检查"
+            exit 0
+        fi
+        err=$(echo "$status" | awk -F': ' '/Last_IO_Error:|Last_SQL_Error:/{print}')
+        handle_replication_problem "$role" "IO=${io:-N/A}, SQL=${sql_r:-N/A}" "$err"
         exit 0
     fi
 
+    rm -f "$REPAIR_CNT_FILE" "$REPAIR_TS_FILE" 2>/dev/null || true
     log_limited backup_ok 300 "BACKUP 检查通过（IO=${io}, SQL=${sql_r}, 延迟=${lag:-N/A}s）"
     exit 0
 }

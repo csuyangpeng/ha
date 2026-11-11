@@ -742,16 +742,16 @@ tail -f /home/sder/ha/replica/logs/keepalived-wrapper.log
 ### 7.4 核心网健康参与切换
 
 5GC 的 NF（smf/nrf/ausf/udm/pcf/nssf）异常不再只靠人工发现，而是由 coremgr 聚合后交给 keepalived 判定。
-keepalived **不直接探活 NF**，只看一个结论；这样探活逻辑、阈值、重启策略都在 coremgr 内演进，keepalived 配置保持稳定。
+keepalived **不直接探活 NF**，只看一个结论；这样探活逻辑、白名单与阈值都在 coremgr 内演进，keepalived 配置保持稳定。
 
 - coremgr 每 5 秒并发 `GET` 各 NF 的完整 URL，2xx 记为健康；连续 `fail_threshold` 次失败才置 `down`，
   连续 `rise_threshold` 次成功才恢复。配置在节点的
   `/usr/local/coremgr/config/cm_sys_conf.yaml` 的 `ha.nf_health`（仓库模板见 `oam/cm/data/cm_sys_conf.yaml`）。
-- 级别：`critical`（默认 `nrf`、`smf`）故障会导致 `ready=0`，参与倒换；`important`（其余）故障只告警/尝试本地重启，
+- `nfs` 是**探测白名单**：列几个就探几个，留空则不探任何网元；没有内置默认列表，新增/下线 NF 都要改配置。
+- 级别：`critical`（默认 `nrf`、`smf`）故障会导致 `ready=0`，参与倒换；`important`（其余）故障只告警，
   不阻塞 `ready`。
+- coremgr 只探测和上报，**不会重启或操作 NF**；NF 的恢复由 core 自身/运维负责。
 - `enforce: false` 时 verdict 照常生成，但不参与切换（观察模式）；确认探活 URL 全部正确后再打开。
-- `restart_enable: true` 时，`important` NF 连续故障会由 coremgr 通过容器管理接口原地重启，并受冷却时间、
-  时间窗内次数上限约束；手动倒换进行中、处于提升宽限期、或正在执行 init/start/stop/upgrade/patch/rollback 时不会重启。
 - 探活 URL 必须写真实路径：NRF 是 `/health_check`，不是 `/health`。用
   `curl -sS -o /dev/null -w '%{http_code}\n' <url>` 逐条确认后再打开 enforce。
 
@@ -773,7 +773,7 @@ MySQL 硬故障路径额外做对端检查：`CORE_PEER_GATE_MYSQL=1`（默认�
 回滚/降噪：
 
 - 只想关掉核心网参与切换：把 `nf_health.enforce` 置 `false` 并重启 coremgr，无需改 keepalived。
-- 只想关掉自动重启：`restart_enable: false`。
+- NF 的恢复由 core 自身/运维负责，coremgr 不会操作容器；需要减少误报时调整 `nfs` 白名单、URL 或阈值。
 - 调整阈值：`interval`、`fail_threshold`、`grace`、`stale_after`；`stale_after` 必须大于 `interval`。
 - 升级 NF 前先置 `enforce: false` 可以避免滚动升级期间判为故障；升级完恢复。
 
@@ -915,7 +915,7 @@ docker exec -i mysql mysql -uroot -p's<9!Own1z4' -e "SET GLOBAL read_only=OFF;"
 | verdict 里某个 NF 一直是 `down`，但容器在运行 | `curl -v <该 NF 完整 URL>`；对照 `nf_health.nfs[].url` | 多半是路径写错（NRF 是 `/health_check`，其他常见 `/health`），改配置后重启 coremgr |
 | verdict 不更新 / `updated` 很旧 | `systemctl status coremgr`；`ls -l /var/run/coremgr_nf_health`；coremgr 日志搜 `nf_health` | coremgr 未运行、`/var/run` 不可写（需 root）、或 `nf_health.enable=false` |
 | 对端 `curl :8888/coremgr/ha/health` 失败 | 对端 coremgr 是否运行、`ss -lntp \| grep 8888`、两台防火墙 | 旧版 coremgr 没有该路由，先升级两端；端点不可达时 MySQL 故障仍按原逻辑切换 |
-| NF 反复重启 | verdict `nf_<name>=restarting`；coremgr 日志 `restart`；看该 NF 容器日志 | 先修 NF 本身；临时置 `restart_enable: false` 止损；`restart_cooldown/window/max` 控制频率 |
+| 某个 NF 频繁 down/恢复 | verdict `nf_<name>` 在 `down`/`healthy` 之间跳变；看该 NF 容器日志 | coremgr 不重启 NF，先修 NF 本身；再核对 `grace`、`fail_threshold`、探活 URL 是否合适 |
 | 滚动升级期间发生误切换 | `check-core status` 的 `critical_down_names` | 升级前置 `enforce: false`，升级完成并确认 `ready=1` 后恢复 |
 | 只漂了部分 VIP | `ip -o -4 addr show ens3`；`cat /etc/keepalived/replica-vips`；`/coremgr/ha/status` 的 `vip_incomplete` 告警 | 两台的 `replica-vips` 必须一致；改完后 `keepalived -t` 并重启；不要在运行中手工 `ip addr add` |
 | 想临时退回“只按 MySQL 切换” | — | `nf_health.enforce: false` + 重启 coremgr，无需回退二进制或 keepalived 配置 |
@@ -973,7 +973,7 @@ tail -f /home/sder/ha/replica/logs/etcd-keepalived.log
 | 部署日期 | |
 | 部署人 | |
 | 节点 1 / 节点 2 / VIP 组 | 10.18.1.27 / 10.18.1.28 / 10.18.1.30（可多个，第一个为数据面） |
-| NF 级别 / enforce / restart | 默认 nrf+smf critical，其余 important；enforce=false 观察，确认后开 true |
+| NF 白名单 / 级别 / enforce | 默认探 nrf+smf critical、其余 important；enforce=false 观察，确认后开 true；留空则不探 |
 | 初始主库 | |
 | 数据是否保留 | 是 / 否 |
 | 端口冲突处理 | |

@@ -787,7 +787,7 @@ OMC 主备容灾页面标题栏有一个“自动倒换”开关，默认关闭�
 
 - 打开后，**主用节点**每 `auto_check_sec`（默认 5s）检查一次本机探测结果；
 - 判定为“探测异常”的条件（任一）：
-  - 核心网 `enabled` 且 `ready=0` 且 `critical_down>0`（关键网元已确认故障，不是 grace/未知）；
+  - 核心网状态为 `critical`（关键网元已确认故障；`stale`/`starting`/`grace` 一律不触发）；
   - MySQL 容器运行但未就绪；
   - MySQL 已提升但 `read_only=1`。
 - 需要连续 `auto_fail_threshold`（默认 3）次确认，且**备用节点状态为 `backup_running`**
